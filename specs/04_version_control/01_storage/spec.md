@@ -207,98 +207,14 @@ A PR is a **wrapper over a workspace** — it proposes merging the workspace's c
 
 ## 4. Hashing
 
-All hashing uses **SHA-256**. The hashing scheme is designed so that:
-- Identical content always produces the same hash.
-- Any change, no matter how small, produces a completely different hash.
-- Tree hashes are computed as a **Merkle tree** — a change in any descendant file propagates up to the root.
+> **Moved:** The full hashing specification (blob, tree, commit, and PR hashing algorithms) is now in [02_hashing/spec.md](../02_hashing/spec.md).
 
-### 4.1 Blob Hash
+**Quick reference — all hashing uses SHA-256:**
+- **Blob hash:** `SHA256( "blob\0" + size + "\0" + content )`
+- **Tree hash:** `SHA256( "tree\0" + sorted_child_entries )` (Merkle tree)
+- **Commit hash:** `SHA256( "commit\0" + byte_length + "\0" + content )`
 
-Blobs are hashed using their type tag, size, and raw content:
-
-```
-HASH = SHA256( "blob" + "\0" + size + "\0" + file_content_in_bytes )
-```
-
-- `size` is the byte length of `file_content_in_bytes`, as a decimal string.
-- Two files with identical byte content produce the same blob hash, regardless of filename or path.
-- This matches Git's blob hashing scheme (with SHA-256 instead of SHA-1).
-
-**Example:**
-```
-File content: "hello world" (11 bytes)
-Input to hash: "blob\011\0hello world"
-```
-
-### 4.2 Tree Hash (Merkle Tree)
-
-Trees are hashed using their children's types, names, and hashes — producing a **Merkle hash**:
-
-**Step 1:** For each child entry, create a string:
-```
-"<type> <name>\0<object_hash>"
-```
-Where `type` is either `blob` or `tree`.
-
-**Step 2:** Sort all child strings by **name** (lexicographic, for determinism).
-
-**Step 3:** Concatenate the sorted strings.
-
-**Step 4:** Hash:
-```
-HASH = SHA256( "tree\0" + concatenated_sorted_child_strings )
-```
-
-**Properties:**
-- Renaming a file changes the tree hash (name is part of the input).
-- Changing file content changes the blob hash, which changes the tree hash, which propagates up to the root.
-- Two directories with identical structure and content produce the same tree hash.
-
-**Example:**
-```
-Directory contains:
-  README.md  (blob, hash=abc123...)
-  src/       (tree, hash=def456...)
-
-Sorted child strings:
-  "blob README.md\0abc123..."
-  "tree src\0def456..."
-
-Input to hash: "tree\0blob README.md\0abc123...tree src\0def456..."
-```
-
-### 4.3 Commit Hash
-
-Commits are hashed using Git's format — the hash is computed over a structured header string:
-
-**Step 1:** Build the commit content string:
-```
-tree <root_tree_hash>\n
-parent <parent_hash>\n          ← one line per parent; omitted for the initial commit
-author <name> <email> <unix_timestamp> <timezone>\n
-committer <name> <email> <unix_timestamp> <timezone>\n
-\n
-<message>
-```
-
-**Step 2:** Hash with a type+size header (same pattern as blobs):
-```
-HASH = SHA256( "commit" + "\0" + byte_length(content) + "\0" + content )
-```
-
-- For the initial commit, the `parent` line is omitted entirely.
-- For merge commits, there are **multiple `parent` lines**, one per parent, in order.
-- `unix_timestamp` is seconds since epoch; `timezone` is e.g., `+0530`, `+0000`.
-
-**Example (normal commit):**
-```
-tree 8a7f2b...
-parent 3c9d1e...
-author Ayush <ayush@example.com> 1743264000 +0530
-committer Ayush <ayush@example.com> 1743264000 +0530
-
-fix: resolve workspace sync issue
-```
+See [02_hashing/spec.md](../02_hashing/spec.md) for the complete algorithms, examples, PR fingerprinting, and integrity verification procedures.
 
 ---
 
