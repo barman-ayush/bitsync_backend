@@ -136,14 +136,28 @@ Tracks files the user has modified but **not yet committed**. This is the equiva
 |--------------|------------|----------------------------------------------------------|
 | id           | UUID (PK)  | Unique identifier                                         |
 | workspace_id | UUID (FK)  | The workspace these changes belong to                     |
-| file_path    | TEXT       | Full path of the changed file                             |
+| file_path    | TEXT       | Path of the changed file, relative to repo root (see format below) |
 | action       | ENUM       | `ADD` / `MODIFY` / `DELETE`                               |
 | blob_hash    | TEXT (FK)  | New content blob (`NULL` for DELETE)                      |
+
+**`file_path` format:**
+- Relative to the repository root — **no leading slash**.
+- Uses **forward slashes** (`/`) as the directory separator, regardless of OS.
+- **No trailing slash** — file paths always point to a file, not a directory.
+- Directory structure is implicit — directories are not tracked directly, they are derived from file paths.
+
+| Location                          | `file_path` value              |
+|-----------------------------------|--------------------------------|
+| File at repo root                 | `config.json`                  |
+| File one level deep               | `src/main.py`                  |
+| File nested in subdirectories     | `src/services/auth.py`         |
+| File with spaces in name          | `docs/my notes.md`             |
 
 **Constraints:**
 - `(workspace_id, file_path)` must be **unique** — one pending change per file path per workspace.
 - On commit, all `workspace_changes` for the workspace are baked into the new commit and then **cleared**.
 - For `ADD`/`MODIFY`, the blob must already exist in the `blob` table (uploaded separately).
+- `file_path` must not contain: leading `/`, trailing `/`, consecutive slashes (`//`), or path traversal segments (`..`).
 
 ### 3.7 Repository
 
