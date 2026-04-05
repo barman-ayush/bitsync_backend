@@ -118,15 +118,15 @@ A commit is a **snapshot** of the entire repo at a point in time. The head commi
 | repo_id    | UUID (FK)  | The repository this workspace belongs to                  |
 | user_id    | UUID (FK)  | The user who owns this workspace                          |
 | name       | TEXT       | Human-readable workspace name                             |
-| fork_point | TEXT (FK)  | Commit hash the workspace was forked from                 |
+| fork_point | TEXT (FK)  | Commit hash the workspace was originally forked from (creation-time record, **not used as merge base** — see §5.1) |
 | head       | TEXT (FK)  | Current tip commit in this workspace                      |
 | status     | ENUM       | `CLEAN` / `MERGING` / `CONFLICTED`                        |
 | created_at | TIMESTAMP  | Creation time                                             |
 | updated_at | TIMESTAMP  | Last update time                                          |
 
-**Lifecycle:** Workspaces can be reused after merge. On PR merge, `fork_point` is updated to the new repo HEAD. The user can continue making changes and open new PRs from the same workspace.
+**Lifecycle:** Workspaces can be reused after merge. The user can continue making changes and open new PRs from the same workspace.
 
-**Critical invariant:** After a PR merge, `workspace.fork_point` **must** be updated to the new repo HEAD. Failing to do so causes the next merge to use a stale base, leading to duplicate changes and false conflicts.
+**`fork_point` is informational, not functional.** It records where repo HEAD was when the workspace was created. It is **never used as the merge base** — the common ancestor is always computed dynamically via `merge_base()` (see §5.1). This avoids broken parent chains when a workspace has extra commits beyond what was merged in a PR.
 
 ### 3.6 Workspace Changes (Uncommitted State)
 
@@ -243,7 +243,7 @@ Repository ──1:1──> Commit (head_commit, nullable)
 
 Workspace ──N:1──> Repository
 Workspace ──N:1──> User
-Workspace ──1:1──> Commit (fork_point)
+Workspace ──1:1──> Commit (fork_point — creation-time record)
 Workspace ──1:1──> Commit (head)
 Workspace ──1:N──> Workspace Changes
 Workspace ──1:N──> Pull Request
@@ -273,6 +273,114 @@ For merge commits that have multiple parents, a separate join table is used:
 | ordinal     | INT      | Order of the parent (0-based)  |
 
 **Constraint:** `(commit_hash, ordinal)` is unique.
+
+### 5.1 Graph Utilities
+
+These functions operate on the commit DAG and are used by the merge and PR specs. They walk **all parents** (via `commit_parents` table), not just `commit.parent`.
+
+#### `get_all_parents(commit_hash)`
+
+Returns all parent hashes for a commit, ordered by ordinal.
+
+```
+function get_all_parents(commit_hash):
+    parents = SELECT parent_hash FROM commit_parents
+              WHERE commit_hash = commit_hash
+              ORDER BY ordinal
+
+    if parents is empty:
+        // Regular (non-merge) commit — fall back to single parent field
+        commit = SELECT parent FROM commit WHERE commit_hash = commit_hash
+        if commit.parent is not NULL:
+            return [commit.parent]
+        return []
+
+    return parents
+```
+
+#### `merge_base(commit_a, commit_b)`
+
+Finds the most recent common ancestor of two commits by doing a **parallel BFS** from both sides, walking all parents at each step.
+
+```
+function merge_base(commit_a, commit_b):
+    if commit_a == commit_b:
+        return commit_a
+
+    // Track visited commits and which side visited them
+    visited_a = { commit_a: 0 }    // commit_hash → depth
+    visited_b = { commit_b: 0 }
+    queue_a = [commit_a]
+    queue_b = [commit_b]
+
+    while queue_a is not empty OR queue_b is not empty:
+
+        // Expand one level from side A
+        if queue_a is not empty:
+            next_a = []
+            for current in queue_a:
+                for parent in get_all_parents(current):
+                    if parent in visited_b:
+                        return parent    // found common ancestor
+                    if parent not in visited_a:
+                        visited_a[parent] = visited_a[current] + 1
+                        next_a.append(parent)
+            queue_a = next_a
+
+        // Expand one level from side B
+        if queue_b is not empty:
+            next_b = []
+            for current in queue_b:
+                for parent in get_all_parents(current):
+                    if parent in visited_a:
+                        return parent    // found common ancestor
+                    if parent not in visited_b:
+                        visited_b[parent] = visited_b[current] + 1
+                        next_b.append(parent)
+            queue_b = next_b
+
+    return NULL    // no common ancestor (disconnected graphs — shouldn't happen)
+```
+
+**Why this works:** Merge commits record both parents in `commit_parents`. When BFS reaches a merge commit, it follows **both** parents. This means the second parent path (e.g., from M back to F via M's second parent) is discovered, and the true divergence point is found — even when `workspace.fork_point` has gone stale.
+
+**Example:**
+```
+Repo:  A → B → C → D → M (HEAD)     M's parents: [D, F]
+                \      /
+                 E → F → G → H      (workspace.head)
+
+merge_base(M, H):
+  BFS from M: M → D, F → C, E → B → A
+  BFS from H: H → G → F  ← found! F is in visited_a
+  
+  Returns F (the true divergence point)
+```
+
+#### `is_ancestor_of(ancestor, descendant)`
+
+Checks if `ancestor` is reachable by walking back from `descendant` through **all parents**.
+
+```
+function is_ancestor_of(ancestor, descendant):
+    if ancestor == descendant:
+        return true
+
+    visited = {}
+    queue = [descendant]
+
+    while queue is not empty:
+        current = queue.pop()
+        if current == ancestor:
+            return true
+        if current in visited:
+            continue
+        visited[current] = true
+        for parent in get_all_parents(current):
+            queue.append(parent)
+
+    return false
+```
 
 ---
 

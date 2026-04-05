@@ -312,7 +312,7 @@ When a PR is merged, three commit hashes are frozen as a permanent record:
 
 | Field           | Description                                                      |
 |-----------------|------------------------------------------------------------------|
-| `base_commit`   | The `workspace.fork_point` at merge time — the common ancestor   |
+| `base_commit`   | The computed `merge_base()` at merge time — the common ancestor  |
 | `head_commit`   | The `workspace.head` at merge time — the tip of the workspace    |
 | `merge_commit`  | The resulting merge/fast-forward commit — the new repo HEAD      |
 
