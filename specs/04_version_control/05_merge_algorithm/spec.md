@@ -322,6 +322,14 @@ function fast_forward_merge(pr, workspace, repo):
         updated_at = now()
     WHERE id = workspace.id
 
+    // ──────────────────────────────────────────────
+    // STEP 4: Notify PR author
+    // ──────────────────────────────────────────────
+    createNotification(pr.author_id, "pr_merged", {
+        repoId: repo.id, repoName: repo.name,
+        prId: pr.id, prTitle: pr.title, mergeCommit: pr.pr_head
+    })
+
     return { status: "MERGED", merge_type: "FAST_FORWARD" }
 ```
 
@@ -427,6 +435,15 @@ function three_way_merge(pr, workspace, repo, base):
 
     // Mark workspace as conflicted
     UPDATE workspace SET status = "CONFLICTED"
+
+    // Notify PR author about conflicts
+    repo = SELECT * FROM repo WHERE id = pr.repo_id
+    createNotification(pr.author_id, "merge_conflicts", {
+        repoId: repo.id, repoName: repo.name,
+        prId: pr.id, prTitle: pr.title,
+        conflictCount: len(result.conflicts),
+        mergeStateId: merge_state.id
+    })
 
     return {
         status: "CONFLICTS_DETECTED",
@@ -535,6 +552,15 @@ function finalize_merge(merge_state, pr, workspace, repo):
     // ──────────────────────────────────────────────
     UPDATE merge_state SET status = "RESOLVED"
 
+    // ──────────────────────────────────────────────
+    // STEP 8: Notify PR author
+    // ──────────────────────────────────────────────
+    repo = SELECT * FROM repo WHERE id = pr.repo_id
+    createNotification(pr.author_id, "pr_merged", {
+        repoId: repo.id, repoName: repo.name,
+        prId: pr.id, prTitle: pr.title, mergeCommit: merge_commit_hash
+    })
+
     return { status: "MERGED", merge_type: "THREE_WAY", merge_commit: merge_commit_hash }
 ```
 
@@ -591,8 +617,16 @@ Body:
 **Algorithm:**
 
 ```
-function resolve_conflict(conflict_id, resolution, manual_content):
+function resolve_conflict(conflict_id, user_id, resolution, manual_content):
     conflict = load_conflict(conflict_id)
+    merge_state = SELECT * FROM merge_state WHERE id = conflict.merge_state_id
+    pr = SELECT * FROM pull_request WHERE id = merge_state.pr_id
+
+    // ──────────────────────────────────────────────
+    // Permission check: only PR author, repo admins, or owner
+    // ──────────────────────────────────────────────
+    ASSERT user_id == pr.author_id
+        OR user_has_repo_role(user_id, pr.repo_id, ["admin", "owner"])
 
     if resolution == "TAKE_OURS":
         resolved_hash = conflict.ours_blob       // may be NULL (delete)
@@ -638,15 +672,98 @@ function check_all_conflicts_resolved(merge_state_id):
 
 ---
 
-## 9. Edge Cases
+## 9. Merge Revert
 
-### 9.1 Empty Merge (No Changes)
+If a merge produces incorrect results (bad conflict resolution, accidental merge), the user can **revert** it. A revert does not delete history — it creates a new commit that restores the pre-merge state.
+
+### 9.1 Algorithm
+
+```
+function revert_merge(pr_id, user_id):
+
+    // ──────────────────────────────────────────────
+    // STEP 1: Load and validate
+    // ──────────────────────────────────────────────
+    pr   = SELECT * FROM pull_request WHERE id = pr_id
+    repo = SELECT * FROM repo WHERE id = pr.repo_id
+
+    ASSERT pr.status == "MERGED"
+    ASSERT pr.merge_commit is not NULL
+
+    // Only PR author, repo admins, or owner can revert
+    ASSERT user_id == pr.author_id
+        OR user_has_repo_role(user_id, pr.repo_id, ["admin", "owner"])
+
+    // ──────────────────────────────────────────────
+    // STEP 2: Find the pre-merge state
+    // ──────────────────────────────────────────────
+    // The merge commit's first parent (ordinal 0) is the repo HEAD
+    // before the merge. Its tree is the state we want to restore.
+    pre_merge_commit = SELECT parent_hash FROM commit_parents
+                       WHERE commit_hash = pr.merge_commit AND ordinal = 0
+    pre_merge_tree = load_commit(pre_merge_commit).root_tree
+
+    // ──────────────────────────────────────────────
+    // STEP 3: Create revert commit
+    // ──────────────────────────────────────────────
+    // The revert commit has the current repo HEAD as parent
+    // and the pre-merge tree as its root_tree.
+    // This effectively "undoes" the merge by restoring the old tree.
+    revert_content = build_commit_content(
+        tree:    pre_merge_tree,
+        parents: [repo.head_commit],
+        author:  user_id,
+        message: "Revert \"Merge PR #" + pr.id + ": " + pr.title + "\""
+    )
+    revert_hash = SHA256("commit\0" + byte_length(revert_content) + "\0" + revert_content)
+
+    INSERT INTO commit (commit_hash, root_tree, parent, author, timestamp, message, parent_workspace_id)
+    VALUES (revert_hash, pre_merge_tree, repo.head_commit, user_id, now(), revert_content.message, NULL)
+
+    INSERT INTO commit_parents (commit_hash, parent_hash, ordinal)
+    VALUES (revert_hash, repo.head_commit, 0)
+
+    // ──────────────────────────────────────────────
+    // STEP 4: Advance repo HEAD (with optimistic locking)
+    // ──────────────────────────────────────────────
+    rows = UPDATE repo SET head_commit = revert_hash
+           WHERE id = repo.id AND head_commit = repo.head_commit
+    if rows == 0:
+        ERROR("Concurrent modification — repo HEAD moved. Retry.")
+
+    // ──────────────────────────────────────────────
+    // STEP 5: Emit notification
+    // ──────────────────────────────────────────────
+    createNotification(pr.author_id, "pr_reverted", {
+        repoId: repo.id,
+        repoName: repo.name,
+        prId: pr.id,
+        prTitle: pr.title,
+        revertedBy: user_id,
+        revertCommit: revert_hash
+    })
+
+    return { status: "REVERTED", revert_commit: revert_hash }
+```
+
+### 9.2 What a Revert Does NOT Do
+
+- Does **not** change the PR's status — it stays `MERGED`. The merge happened; the revert is a separate commit.
+- Does **not** delete the merge commit — history is preserved, the revert is additive.
+- Does **not** restore the workspace to pre-merge state — the workspace's `fork_point` is unchanged.
+- The reverted changes can be re-merged by opening a new PR. `merge_base()` will correctly compute the common ancestor from the graph.
+
+---
+
+## 10. Edge Cases
+
+### 10.1 Empty Merge (No Changes)
 If `merge_base(repo.head_commit, pr.pr_head) == pr.pr_head`, the PR's commits are already in the repo history. Reject the merge — nothing to merge. (This is checked by the PR spec's validation: `pr_head` must have commits beyond the common ancestor.)
 
-### 9.2 Workspace Has Uncommitted Changes
+### 10.2 Workspace Has Uncommitted Changes
 If `workspace_changes` is not empty when a merge is triggered, reject it. The user must commit or discard changes first. Cannot merge dirty state.
 
-### 9.3 Concurrent Merges
+### 10.3 Concurrent Merges
 Two PRs merged simultaneously could both read the same `repo.head_commit` and try to advance it. Use **optimistic locking**:
 ```
 UPDATE repo SET head_commit = new_hash
@@ -654,7 +771,7 @@ WHERE id = repo_id AND head_commit = expected_old_hash
 // If 0 rows affected → someone else merged first → retry or abort
 ```
 
-### 9.4 Conflict During Rebase
+### 10.4 Conflict During Rebase
 In rebase mode, each workspace commit is replayed one-by-one. A conflict can arise at **any replay step**. The merge state must track which commit is currently being replayed:
 
 ```
@@ -664,7 +781,7 @@ Additional field on merge_state:
   rebase_total:          INT    // total workspace commits to replay
 ```
 
-### 9.5 Abort Merge
+### 10.5 Abort Merge
 User can abort a merge in progress:
 ```
 function abort_merge(merge_state_id):
@@ -679,8 +796,138 @@ function abort_merge(merge_state_id):
     UPDATE merge_state SET status = "ABORTED"
 ```
 
-### 9.6 File Renamed on One Side
+### 10.6 File Renamed on One Side
+
+Without rename detection, renames appear as a DELETE + ADD pair, causing false conflicts. This section specifies how to detect and handle renames during the three-way merge.
+
+#### 10.6.1 The Problem
+
 If OURS renames `a.py → b.py` and THEIRS modifies `a.py`:
-- At the tree level, this appears as: OURS deleted `a.py` + added `b.py`; THEIRS modified `a.py`
-- Results in a DELETE_EDIT conflict on `a.py`
-- **Rename detection** (optional, future): compare blob hashes of deleted and added files. If `deleted_blob == added_blob`, it's a rename, not a delete+add. This can be used to apply THEIRS' changes to the renamed file automatically.
+- Tree-level diff sees: OURS deleted `a.py` + added `b.py`; THEIRS modified `a.py`
+- Without rename detection: DELETE_EDIT conflict on `a.py`, and `b.py` appears as a new file
+- The user must manually realize this was a rename and apply their edits to `b.py`
+
+#### 10.6.2 Rename Detection Algorithm
+
+Run rename detection as a **post-processing step** after `three_way_tree_merge` (§4.1) produces its initial `merged_paths` and `conflicts` list, but before returning results.
+
+```
+function detect_renames(base_map, ours_map, theirs_map, conflicts):
+
+    // ──────────────────────────────────────────────
+    // STEP 1: Collect candidate pairs
+    // ──────────────────────────────────────────────
+    // Find files that were DELETED on one side and ADDED on the same side.
+    // If the deleted file's base_blob == added file's blob, it's a rename.
+
+    ours_deleted  = { path: base_map[path] for path in base_map if path NOT in ours_map }
+    ours_added    = { path: ours_map[path]  for path in ours_map  if path NOT in base_map }
+
+    theirs_deleted = { path: base_map[path] for path in base_map if path NOT in theirs_map }
+    theirs_added   = { path: theirs_map[path] for path in theirs_map if path NOT in base_map }
+
+    renames = []
+
+    // ──────────────────────────────────────────────
+    // STEP 2: Match deleted → added by blob hash (exact match)
+    // ──────────────────────────────────────────────
+    // Check OURS side: deleted file's base blob == added file's blob
+    for del_path, del_hash in ours_deleted:
+        for add_path, add_hash in ours_added:
+            if del_hash == add_hash:
+                renames.append({
+                    side:      "OURS",
+                    old_path:  del_path,
+                    new_path:  add_path,
+                    blob_hash: del_hash
+                })
+                ours_added.remove(add_path)
+                break    // one match per deleted file
+
+    // Same for THEIRS side
+    for del_path, del_hash in theirs_deleted:
+        for add_path, add_hash in theirs_added:
+            if del_hash == add_hash:
+                renames.append({
+                    side:      "THEIRS",
+                    old_path:  del_path,
+                    new_path:  add_path,
+                    blob_hash: del_hash
+                })
+                theirs_added.remove(add_path)
+                break
+
+    return renames
+```
+
+#### 10.6.3 Applying Renames to Conflict Resolution
+
+After detecting renames, rewrite the affected conflicts:
+
+```
+function apply_rename_resolution(renames, conflicts, merged_paths, base_map, ours_map, theirs_map):
+
+    for rename in renames:
+
+        // ──────────────────────────────────────────
+        // CASE 1: OURS renamed, THEIRS modified the old path
+        // ──────────────────────────────────────────
+        if rename.side == "OURS":
+            theirs_blob = theirs_map.get(rename.old_path)
+
+            if theirs_blob is not NULL and theirs_blob != base_map[rename.old_path]:
+                // THEIRS modified the file at the old path.
+                // Apply THEIRS' changes to the new path instead.
+                // Remove the DELETE_EDIT conflict on old_path.
+                remove_conflict(conflicts, rename.old_path)
+
+                // The file at new_path has OURS' (renamed, unchanged content).
+                // Replace it with THEIRS' modified version at the new path.
+                // This is an EDIT_EDIT on the new path — OURS has the original
+                // content (just renamed), THEIRS has modified content.
+                merged_paths[rename.new_path] = theirs_blob
+                merged_paths.remove(rename.old_path)    // ensure old path deleted
+
+            elif theirs_blob is NULL:
+                // THEIRS also deleted the old path — both sides agree it's gone.
+                // Keep the rename (file exists at new_path via OURS).
+                remove_conflict(conflicts, rename.old_path)
+
+        // ──────────────────────────────────────────
+        // CASE 2: THEIRS renamed, OURS modified the old path
+        // ──────────────────────────────────────────
+        if rename.side == "THEIRS":
+            ours_blob = ours_map.get(rename.old_path)
+
+            if ours_blob is not NULL and ours_blob != base_map[rename.old_path]:
+                // OURS modified the file at the old path.
+                // Apply OURS' changes to the new path instead.
+                remove_conflict(conflicts, rename.old_path)
+                merged_paths[rename.new_path] = ours_blob
+                merged_paths.remove(rename.old_path)
+
+            elif ours_blob is NULL:
+                // OURS also deleted — both agree. Keep rename.
+                remove_conflict(conflicts, rename.old_path)
+```
+
+#### 10.6.4 Rename Conflict: Both Sides Renamed Same File Differently
+
+```
+OURS:   a.py → b.py
+THEIRS: a.py → c.py
+```
+
+Both appear as DELETE of `a.py` + ADD of different paths. After rename detection, both sides deleted the same file and added different new files. This is a **rename-rename conflict**:
+
+- `a.py` is deleted on both sides → RESOLVED (delete)
+- `b.py` exists only in OURS → RESOLVED (keep)
+- `c.py` exists only in THEIRS → RESOLVED (keep)
+- **Both files survive** at their respective new paths. No conflict — both renames are applied.
+
+If both sides renamed to the **same** new path but with different content, this falls through to ADD_ADD conflict on the new path (already handled by §4.3).
+
+#### 10.6.5 Limitations
+
+- **Exact match only:** Rename detection requires identical blob hashes (the file content must be unchanged). If a file is renamed AND modified, the blob hashes differ, and it appears as an unrelated delete + add. Fuzzy rename detection (similarity threshold) is a future enhancement.
+- **One-to-one:** Each deleted file matches at most one added file. If the same content appears at multiple new paths, only the first match is treated as a rename.

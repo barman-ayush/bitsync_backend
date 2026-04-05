@@ -1,0 +1,4 @@
+/node_modules
+/specs/known-issues/
+/specs/features/
+claude --resume 60bbb66b-733d-4662-a43d-ee1d838ad9e9

@@ -133,6 +133,14 @@ function create_pr(repo_id, workspace_id, author_id, title, description):
         updated_at:   now()
     )
 
+    // ──────────────────────────────────────────────
+    // STEP 6: Notify repo admins and owner
+    // ──────────────────────────────────────────────
+    notifyRepoAdmins(repo_id, author_id, "pr_created", {
+        repoId: repo_id, repoName: repo.name,
+        prId: pr.id, prTitle: title, authorName: author_id
+    })
+
     return pr
 ```
 
@@ -305,6 +313,14 @@ function close_pr(pr_id, user_id):
         status     = "CLOSED",
         updated_at = now()
     WHERE id = pr_id
+
+    // Notify PR author (if closed by someone else)
+    if user_id != pr.author_id:
+        repo = SELECT * FROM repo WHERE id = pr.repo_id
+        createNotification(pr.author_id, "pr_rejected", {
+            repoId: pr.repo_id, repoName: repo.name,
+            prId: pr.id, prTitle: pr.title, closedBy: user_id
+        })
 
     return pr
 ```

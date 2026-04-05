@@ -46,10 +46,13 @@ function resolve_tree(tree_hash):
               WHERE parent_tree = tree_hash
               ORDER BY entry_type DESC, name ASC    // folders first, then files, alphabetical
 
-    // 2. For blob entries, join with blob table to get size
-    for entry in entries:
-        if entry.type == "blob":
-            entry.size = SELECT size FROM blob WHERE blob_hash = entry.object_hash
+    // 2. For blob entries, batch-fetch sizes in a single JOIN query
+    //    (avoids N+1: one query instead of one per blob)
+    entries = SELECT te.name, te.entry_type, te.object_hash, b.size
+              FROM tree_entry te
+              LEFT JOIN blob b ON te.entry_type = 'blob' AND te.object_hash = b.blob_hash
+              WHERE te.parent_tree = tree_hash
+              ORDER BY te.entry_type DESC, te.name ASC
 
     // 3. Return entries (client decides when to expand subtrees)
     return {
@@ -298,6 +301,12 @@ function build_tree_from_changes(parent_commit, changes):
                     })
                 else:
                     // Clean subtree — REUSE the existing tree hash
+                    // Guard: if the directory is new (not in parent commit),
+                    // it MUST be in dirty_dirs. If we reach here, the directory
+                    // existed in the parent commit and is unchanged.
+                    if child_dir_path NOT in parent_dir_map:
+                        ERROR("Bug: clean subtree " + child_dir_path + " not found in parent. "
+                              + "New directories must be in dirty_dirs.")
                     entries.append({
                         entry_type: "tree",
                         name: child_name,
@@ -318,6 +327,43 @@ function build_tree_from_changes(parent_commit, changes):
 
     // The root tree hash is the final result
     return new_tree_hashes[""]
+```
+
+**Example: Adding a file in a new subdirectory**
+
+This demonstrates CRIT-01 — adding `src/lib/helper.py` where `src/lib/` never existed:
+
+```
+Parent tree:
+  README.md       → blob aaa
+  src/main.py     → blob bbb
+  src/utils.py    → blob ccc
+
+Change: ADD src/lib/helper.py → blob ddd
+
+STEP 2: path_map gains "src/lib/helper.py" → { blob, ddd }
+
+STEP 3: dirty_dirs = { "src/lib/", "src/", "" }
+         "src/lib/" is dirty because helper.py was added inside it.
+
+STEP 4 (bottom-up):
+  Process "src/lib/" (deepest):
+    children: helper.py (blob ddd)
+    → new tree hash for src/lib/
+
+  Process "src/" (dirty):
+    children: main.py (blob bbb), utils.py (blob ccc), lib/ (dirty → use new_tree_hashes["src/lib/"])
+    → new tree hash for src/
+
+  Process "" (root):
+    children: README.md (blob aaa), src/ (dirty → use new_tree_hashes["src/"])
+    → new root tree hash
+
+Note: "src/lib/" is NOT in parent_dir_map (it didn't exist before).
+But it IS in dirty_dirs, so the guard clause is never reached for it.
+The guard only fires for clean subtrees — if "src/lib/" were somehow
+clean AND missing from parent_dir_map, that would be a bug, and the
+guard clause catches it.
 ```
 
 ### 2.4 Algorithm: Create Commit
@@ -374,12 +420,18 @@ function create_commit(workspace_id, author, message):
     VALUES (commit_hash, new_root_tree, workspace.head, author, timestamp, message, workspace_id)
 
     // ──────────────────────────────────────────────
-    // STEP 6: Update workspace state
+    // STEP 6: Update workspace state (with optimistic locking)
     // ──────────────────────────────────────────────
-    UPDATE workspace
-    SET head = commit_hash,
-        updated_at = now()
-    WHERE id = workspace_id
+    // Compare-and-swap on workspace.head to prevent concurrent commits
+    // from silently overwriting each other. If two commits read the same
+    // workspace.head, both compute trees from the same parent. Without
+    // this check, the second commit would overwrite the first.
+    rows = UPDATE workspace
+           SET head = commit_hash,
+               updated_at = now()
+           WHERE id = workspace_id AND head = workspace.head
+    if rows == 0:
+        ERROR("Concurrent commit detected — workspace head moved. Retry.")
 
     // ──────────────────────────────────────────────
     // STEP 7: Clear uncommitted changes
@@ -394,7 +446,12 @@ function create_commit(workspace_id, author, message):
 Recursively walks a tree and produces a flat path → hash map.
 
 ```
-function flatten_tree(tree_hash, prefix = ""):
+MAX_TREE_DEPTH = 256
+
+function flatten_tree(tree_hash, prefix = "", depth = 0):
+    if depth > MAX_TREE_DEPTH:
+        ERROR("Maximum directory nesting depth (256) exceeded at: " + prefix)
+
     path_map = {}
 
     entries = SELECT * FROM tree_entry WHERE parent_tree = tree_hash
@@ -406,7 +463,7 @@ function flatten_tree(tree_hash, prefix = ""):
             path_map[full_path] = { type: "blob", hash: entry.object_hash }
         elif entry.entry_type == "tree":
             // Recurse into subdirectory
-            sub_paths = flatten_tree(entry.object_hash, full_path + "/")
+            sub_paths = flatten_tree(entry.object_hash, full_path + "/", depth + 1)
             path_map.merge(sub_paths)
             // Also record the directory itself for reuse lookups
             path_map[full_path + "/"] = { type: "tree", hash: entry.object_hash }

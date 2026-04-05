@@ -418,7 +418,11 @@ function verify_commit(commit):
 To verify the integrity of the entire repository from a single commit:
 
 ```
-function verify_repository(commit_hash):
+function verify_repository(commit_hash, visited = {}):
+    if commit_hash in visited:
+        return true    // already verified (handles DAG convergence)
+    visited[commit_hash] = true
+
     // 1. Verify this commit
     commit = load_commit(commit_hash)
     ASSERT verify_commit(commit)
@@ -426,9 +430,12 @@ function verify_repository(commit_hash):
     // 2. Verify the root tree (recursively verifies all subtrees and blobs)
     ASSERT verify_tree_recursive(commit.root_tree)
 
-    // 3. Verify parent chain (walk history)
-    if commit.parent is not NULL:
-        ASSERT verify_repository(commit.parent)    // recursive — or iterative in practice
+    // 3. Verify ALL parents (walks full DAG, not just first parent)
+    // Uses get_all_parents() from storage spec §5.1 to follow merge commit
+    // second parents. Without this, commits reachable only via a merge
+    // commit's second parent would be silently skipped.
+    for parent in get_all_parents(commit_hash):
+        ASSERT verify_repository(parent, visited)
 
     return true
 

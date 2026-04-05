@@ -84,11 +84,13 @@ A tree entry represents a **single entry within a directory** — either a file 
 | parent_tree  | TEXT (FK)| Hash of the tree this entry belongs to                |
 | entry_type   | ENUM     | `blob` or `tree`                                      |
 | name         | TEXT     | Name of the file or subdirectory                      |
-| object_hash  | TEXT     | Hash of the referenced blob or tree                   |
+| object_hash  | TEXT     | Hash of the referenced blob or tree (polymorphic FK — see note below) |
 
 **Constraints:**
 - `(parent_tree, name)` must be **unique** — no two entries in the same tree can have the same name.
 - `entry_type` determines whether `object_hash` references the `blob` table or the `tree` table.
+
+**Note on `object_hash`:** This is a **polymorphic foreign key** — it references `blob.blob_hash` when `entry_type = 'blob'`, or `tree.tree_hash` when `entry_type = 'tree'`. The naming differs from the target tables (`blob_hash`, `tree_hash`) intentionally, since the reference is type-dependent. Always check `entry_type` before resolving `object_hash`.
 
 ### 3.4 Commit
 
@@ -159,6 +161,8 @@ Tracks files the user has modified but **not yet committed**. This is the equiva
 - For `ADD`/`MODIFY`, the blob must already exist in the `blob` table (uploaded separately).
 - `file_path` must not contain: leading `/`, trailing `/`, consecutive slashes (`//`), or path traversal segments (`..`).
 
+**Concurrent edits:** If two sessions (e.g., two browser tabs) modify the same file in the same workspace simultaneously, **last-write-wins** — the second `UPSERT` overwrites the first with no conflict detection. This is expected behavior: a workspace is a single user's working copy, not a collaborative editing surface.
+
 ### 3.7 Repository
 
 | Field       | Type       | Description                                              |
@@ -182,16 +186,18 @@ A PR is a **wrapper over a workspace** — it proposes merging the workspace's c
 | author_id     | UUID (FK)  | User who created the PR                                  |
 | title         | TEXT       | PR title                                                 |
 | description   | TEXT       | PR description                                           |
-| status        | ENUM       | `OPEN` / `APPROVED` / `CHANGES_REQUESTED` / `MERGED` / `CLOSED` |
-| base_commit   | TEXT (FK)  | Snapshotted from `workspace.fork_point` **at merge time** (`NULL` while open) |
-| head_commit   | TEXT (FK)  | Snapshotted from `workspace.head` **at merge time** (`NULL` while open) |
+| status        | ENUM       | `OPEN` / `MERGED` / `CLOSED`                             |
+| pr_head       | TEXT (FK)  | Latest commit included in the PR (user-controlled). Immutable once `MERGED`. |
+| base_commit   | TEXT (FK)  | Computed `merge_base()` frozen **at merge time** (`NULL` while open) |
 | merge_commit  | TEXT (FK)  | The resulting merge/fast-forward commit (`NULL` until merged) |
 | created_at    | TIMESTAMP  | Creation time                                            |
 | updated_at    | TIMESTAMP  | Last update time                                         |
 
-**While open:** `base_commit`, `head_commit`, and `merge_commit` are all `NULL`. The PR's commit range is derived live from `workspace.fork_point` → `workspace.head`. This means new commits pushed to the workspace automatically appear in the PR.
+**While open:** `base_commit` and `merge_commit` are `NULL`. The PR's commit range is derived live from `merge_base(repo.head_commit, pr_head)` → `pr_head`. New commits are included only when the user explicitly advances `pr_head`.
 
-**On merge:** `base_commit`, `head_commit`, and `merge_commit` are frozen as a permanent snapshot. The workspace can then be reused or deleted without losing PR history.
+**On merge:** `base_commit` and `merge_commit` are frozen as a permanent snapshot. `pr_head` becomes immutable. The workspace can then be reused or deleted without losing PR history.
+
+> **Authoritative schema:** See `04_pull_requests/spec.md` §2 for the full PR data model with all field semantics and lifecycle rules.
 
 ### 3.9 PR Review
 
@@ -206,6 +212,8 @@ A PR is a **wrapper over a workspace** — it proposes merging the workspace's c
 
 ### 3.10 PR Comment
 
+Comments can be **general** (on the PR as a whole) or **file-level** (on a specific file in the PR diff). Line-level inline comments are not supported — content-level merge (which would enable meaningful line references) is a future feature.
+
 | Field        | Type       | Description                                              |
 |-------------|------------|----------------------------------------------------------|
 | id          | UUID (PK)  | Unique comment identifier                                 |
@@ -213,7 +221,6 @@ A PR is a **wrapper over a workspace** — it proposes merging the workspace's c
 | author_id   | UUID (FK)  | User who wrote the comment                                |
 | body        | TEXT       | Comment content                                           |
 | file_path   | TEXT       | File path the comment is on (`NULL` for general comments) |
-| line_number | INT        | Line number in the file (`NULL` for general comments)     |
 | created_at  | TIMESTAMP  | Creation time                                             |
 | updated_at  | TIMESTAMP  | Last update time                                          |
 
@@ -392,3 +399,4 @@ function is_ancestor_of(ancestor, descendant):
 4. **Immutability** — Blobs, trees, and commits are never modified after creation. Only references (head_commit, workspace head) change.
 5. **Merkle integrity** — Changing any file in the tree changes every ancestor tree hash up to the root, making tampering detectable.
 6. **Single branch** — The repo has one linear history (with merge commits). Branching happens only in workspaces.
+7. **Timestamps in IST** — All `created_at`, `updated_at`, and other timestamp fields are stored as `TIMESTAMP WITH TIME ZONE` in **IST (Indian Standard Time, UTC+5:30)**. Conversion to other timezones is a client-side concern.

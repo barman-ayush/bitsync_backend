@@ -6,9 +6,10 @@
 2. [Notification Types & Triggers](#2-notification-types--triggers)
 3. [Delivery Channels](#3-delivery-channels)
 4. [Creating Notifications](#4-creating-notifications)
-5. [Signup — Linking Pending Invitations](#5-signup--linking-pending-invitations)
-6. [API Endpoints](#6-api-endpoints)
-7. [Notification Payloads](#7-notification-payloads)
+5. [Integration Points — Where Notifications Are Triggered](#5-integration-points--where-notifications-are-triggered)
+6. [Signup — Linking Pending Invitations](#6-signup--linking-pending-invitations)
+7. [API Endpoints](#7-api-endpoints)
+8. [Notification Payloads](#8-notification-payloads)
 
 ---
 
@@ -26,6 +27,9 @@ CREATE TYPE notification_type AS ENUM (
     'pr_created',
     'pr_merged',
     'pr_rejected',
+    'pr_reviewed',
+    'pr_reverted',
+    'merge_conflicts',
     'member_removed',
     'role_changed'
 );
@@ -82,16 +86,19 @@ CREATE INDEX idx_email_queue_pending ON email_queue (created_at)
 
 Every notification is created server-side when a specific event happens. Here's the complete map:
 
-| Event | Type | Recipient(s) | Title Template | In-App | Email |
-|-------|------|--------------|----------------|--------|-------|
-| User is invited to a repo | `repo_invite` | Invitee | "{inviter} invited you to {repo}" | Yes | Yes |
-| Invitee accepts invitation | `invite_accepted` | Inviter | "{invitee} accepted your invite to {repo}" | Yes | No |
-| Invitee declines invitation | `invite_declined` | Inviter | "{invitee} declined your invite to {repo}" | Yes | No |
-| New PR is created | `pr_created` | All admins + owner | "{author} created a PR in {repo}: {pr_title}" | Yes | Yes |
-| PR is merged | `pr_merged` | PR author | "Your PR was merged in {repo}: {pr_title}" | Yes | Yes |
-| PR is rejected | `pr_rejected` | PR author | "Your PR was rejected in {repo}: {pr_title}" | Yes | Yes |
-| User is removed from repo | `member_removed` | Removed user | "You were removed from {repo}" | Yes | Yes |
-| User's role is changed | `role_changed` | Affected user | "Your role in {repo} changed from {old} to {new}" | Yes | Yes |
+| Event | Type | Recipient(s) | Title Template | In-App | Email | Trigger Location |
+|-------|------|--------------|----------------|--------|-------|-----------------|
+| User is invited to a repo | `repo_invite` | Invitee | "{inviter} invited you to {repo}" | Yes | Yes | RBAC spec §5.1 |
+| Invitee accepts invitation | `invite_accepted` | Inviter | "{invitee} accepted your invite to {repo}" | Yes | No | RBAC spec §5.2 |
+| Invitee declines invitation | `invite_declined` | Inviter | "{invitee} declined your invite to {repo}" | Yes | No | RBAC spec §5.3 |
+| New PR is created | `pr_created` | All admins + owner (excl. author) | "{author} created a PR in {repo}: {pr_title}" | Yes | Yes | PR spec §4.1 |
+| PR is merged | `pr_merged` | PR author | "Your PR was merged in {repo}: {pr_title}" | Yes | Yes | Merge spec §6.4 (finalize_merge) |
+| PR is closed | `pr_rejected` | PR author | "Your PR was closed in {repo}: {pr_title}" | Yes | Yes | PR spec §4.5 |
+| Review submitted on PR | `pr_reviewed` | PR author | "{reviewer} reviewed your PR: {pr_title}" | Yes | Yes | PR review creation |
+| Merge is reverted | `pr_reverted` | PR author | "Your merged PR was reverted: {pr_title}" | Yes | Yes | Merge spec §9.1 (revert_merge) |
+| Merge has conflicts | `merge_conflicts` | PR author | "Merge conflicts in {repo}: {pr_title}" | Yes | Yes | Merge spec §6.3 (three_way_merge) |
+| User is removed from repo | `member_removed` | Removed user | "You were removed from {repo}" | Yes | Yes | RBAC spec §5.6 |
+| User's role is changed | `role_changed` | Affected user | "Your role in {repo} changed from {old} to {new}" | Yes | Yes | RBAC spec §5.5 |
 
 ---
 
@@ -164,6 +171,9 @@ const SHOULD_EMAIL = {
     'pr_created':       true,
     'pr_merged':        true,
     'pr_rejected':      true,
+    'pr_reviewed':      true,
+    'pr_reverted':      true,
+    'merge_conflicts':  true,
     'member_removed':   true,
     'role_changed':     true,
 };
@@ -218,6 +228,24 @@ function buildNotificationContent(type, context) {
                     : 'You are no longer a member of this repository.'
             };
 
+        case 'pr_reviewed':
+            return {
+                title: `${context.reviewerName} reviewed your PR: ${context.prTitle}`,
+                body: `Verdict: ${context.verdict}. ${context.reviewBody || ''}`
+            };
+
+        case 'pr_reverted':
+            return {
+                title: `Your merged PR was reverted: ${context.prTitle}`,
+                body: `${context.revertedByName} reverted the merge in ${context.repoName}.`
+            };
+
+        case 'merge_conflicts':
+            return {
+                title: `Merge conflicts in ${context.repoName}: ${context.prTitle}`,
+                body: `${context.conflictCount} file(s) have conflicts that need resolution.`
+            };
+
         case 'role_changed':
             return {
                 title: `Your role in ${context.repoName} was changed`,
@@ -250,7 +278,37 @@ async function notifyRepoAdmins(repoId, actorId, type, context) {
 
 ---
 
-## 5. Signup — Linking Pending Invitations
+## 5. Integration Points — Where Notifications Are Triggered
+
+Notifications are triggered directly from the business logic functions. Each trigger point calls `createNotification()` or `notifyRepoAdmins()` after the core operation succeeds.
+
+### 5.1 Version Control Triggers
+
+| Event | Trigger Location | Function Call |
+|-------|-----------------|---------------|
+| PR created | `create_pr()` — PR spec §4.1, after successful insert | `notifyRepoAdmins(repo_id, author_id, "pr_created", { repoName, prTitle, authorName, prId })` |
+| PR merged (clean) | `finalize_merge()` — Merge spec §6.4, after step 5 (freeze PR) | `createNotification(pr.author_id, "pr_merged", { repoName, prTitle, prId, mergeCommit })` |
+| PR closed | `close_pr()` — PR spec §4.5, after status update | `createNotification(pr.author_id, "pr_rejected", { repoName, prTitle, prId, closedBy })` |
+| Merge conflicts | `three_way_merge()` — Merge spec §6.3, after conflicts stored | `createNotification(pr.author_id, "merge_conflicts", { repoName, prTitle, prId, conflictCount })` |
+| Merge reverted | `revert_merge()` — Merge spec §9.1, step 5 | `createNotification(pr.author_id, "pr_reverted", { repoName, prTitle, prId, revertedByName, revertCommit })` |
+| Review submitted | PR review creation endpoint | `createNotification(pr.author_id, "pr_reviewed", { repoName, prTitle, prId, reviewerName, verdict, reviewBody })` |
+
+### 5.2 RBAC Triggers
+
+These are already documented in the RBAC spec. For completeness:
+
+| Event | Trigger Location |
+|-------|-----------------|
+| Repo invite | RBAC §5.1 — after invitation created |
+| Invite accepted | RBAC §5.2 — after membership created |
+| Invite declined | RBAC §5.3 — after invitation status updated |
+| Member removed | RBAC §5.6 — after membership deleted |
+| Role changed | RBAC §5.5 — after role updated |
+| Repo deleted | RBAC §5.7 — after soft delete, notify all members |
+
+---
+
+## 6. Signup — Linking Pending Invitations
 
 When a new user signs up, check if they have pending invitations and create notifications:
 
@@ -291,7 +349,7 @@ async function linkPendingInvitations(userId, email) {
 
 ---
 
-## 6. API Endpoints
+## 7. API Endpoints
 
 ### Notification Endpoints
 
@@ -409,7 +467,7 @@ async function markAllAsRead(req, res) {
 
 ---
 
-## 7. Notification Payloads
+## 8. Notification Payloads
 
 The `data` JSONB field contains structured data for client-side routing. When the user clicks a notification, the client uses this data to navigate to the right page.
 

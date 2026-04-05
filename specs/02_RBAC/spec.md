@@ -25,7 +25,7 @@ CREATE TABLE repositories (
     name            VARCHAR(255) NOT NULL,
     description     TEXT,
     owner_id        UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    head_commit_id  UUID,                          -- points to latest commit (FK added later)
+    head_commit     TEXT,                            -- SHA-256 hash of latest commit (see storage spec §3.7)
     is_deleted      BOOLEAN DEFAULT FALSE,         -- soft delete
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -42,6 +42,8 @@ Maps users to repositories with roles. The OWNER is also stored here for uniform
 
 ```sql
 CREATE TYPE repo_role AS ENUM ('owner', 'admin', 'member');
+-- NOTE: 'owner' is assigned automatically on repo creation. It cannot be
+-- assigned via invitation or role change. See §5.1 for invitation constraints.
 
 CREATE TABLE repo_members (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -49,6 +51,7 @@ CREATE TABLE repo_members (
     user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role            repo_role NOT NULL DEFAULT 'member',
     joined_at       TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ,                   -- set on repo soft-delete; NULL = active
 
     UNIQUE (repo_id, user_id)
 );
@@ -335,11 +338,15 @@ Validate:
 Execute:
   2. Soft delete: set is_deleted = true on the repository
      (we don't hard-delete — allows recovery and keeps references intact)
+  3. Cascade soft-delete to memberships:
+     UPDATE repo_members SET deleted_at = NOW() WHERE repo_id = repo.id
+     (This ensures membership queries don't return stale rows for deleted repos.
+      On repo recovery, restore memberships by setting deleted_at = NULL.)
 
 Notify:
-  3. Fetch all members of the repo (except the owner who deleted it)
-  4. Send in-app notification to each ('member_removed', reason: 'repository_deleted')
-  5. Send email to each member
+  4. Fetch all members of the repo (except the owner who deleted it)
+  5. Send in-app notification to each ('member_removed', reason: 'repository_deleted')
+  6. Send email to each member
 ```
 
 ### 5.8 Leave Repository
@@ -381,7 +388,7 @@ async function repoContext(req, res, next) {
 
     // Fetch membership
     const membership = await db.query(
-        'SELECT role FROM repo_members WHERE repo_id = $1 AND user_id = $2',
+        'SELECT role FROM repo_members WHERE repo_id = $1 AND user_id = $2 AND deleted_at IS NULL',
         [repoId, req.user.id]
     );
     if (!membership) {
