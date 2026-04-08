@@ -1,5 +1,7 @@
 # 01 — Authentication Spec
 
+> **Scope:** This spec covers email + password authentication only. OAuth (Google / Microsoft) login, account linking, and "set password for OAuth users" are deferred — see [`future-features.md`](./future-features.md).
+
 ## Table of Contents
 
 1. [Database Tables](#1-database-tables)
@@ -26,7 +28,7 @@ CREATE TABLE users (
     email           VARCHAR(255) UNIQUE NOT NULL,
     display_name    VARCHAR(100) NOT NULL,
     avatar_url      TEXT,
-    password_hash   TEXT,                          -- NULL if user signed up via OAuth only
+    password_hash   TEXT NOT NULL,
     email_verified  BOOLEAN DEFAULT FALSE,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
@@ -36,38 +38,10 @@ CREATE INDEX idx_users_email ON users (email);
 ```
 
 **Notes:**
-- `password_hash` is NULL when the user signed up via OAuth and hasn't set a password
-- If `password_hash` is NOT NULL → user can log in with email + password
-- No `auth_provider` column — the presence of `password_hash` and rows in `user_oauth_links` determine available login methods
+- Every user has a `password_hash` — email + password is the only signup path in the MVP
+- When OAuth lands (see [`future-features.md`](./future-features.md)), `password_hash` becomes nullable
 
-### 1.2 `user_oauth_links`
-
-Allows a single user to link multiple OAuth providers to their account.
-
-```sql
-CREATE TABLE user_oauth_links (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    provider        VARCHAR(20) NOT NULL,          -- 'google' | 'microsoft'
-    provider_id     VARCHAR(255) NOT NULL,         -- provider's unique user ID
-    provider_email  VARCHAR(255),                  -- email from the provider
-    access_token    TEXT,                           -- encrypted OAuth access token (AES-256)
-    refresh_token   TEXT,                           -- encrypted OAuth refresh token (AES-256)
-    token_expires   TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-
-    UNIQUE (provider, provider_id)
-);
-
-CREATE INDEX idx_oauth_links_user ON user_oauth_links (user_id);
-```
-
-**How login resolution works:**
-- Email + password login → find user by email, verify `password_hash`
-- OAuth login → find `user_oauth_links` row by `(provider, provider_id)` → get `user_id`
-- If OAuth login but no link exists → check if email matches existing user → link automatically, or create new user
-
-### 1.3 `refresh_tokens`
+### 1.2 `refresh_tokens`
 
 Stores refresh tokens for session management. Only the SHA-256 hash is stored, never the plaintext token.
 
@@ -237,232 +211,21 @@ Client                          Server
   |  { email, password }          |
   |  ─────────────────────────►   |
   |                               |  1. Find user by email
-  |                               |  2. If user.password_hash is NULL → error:
-  |                               |     "This account uses OAuth. Login with Google/Microsoft
-  |                               |      or set a password in settings."
-  |                               |  3. Verify email_verified = true
-  |                               |  4. bcrypt.compare(password, password_hash)
-  |                               |  5. Generate access_token (JWT, 15min)
-  |                               |  6. Generate refresh_token (random hex, 7days)
-  |                               |  7. Store SHA-256(refresh_token) in refresh_tokens table
-  |                               |  8. Set both httpOnly cookies
+  |                               |  2. Verify email_verified = true
+  |                               |     (if not, send a new verification email
+  |                               |      and redirect with a toast message)
+  |                               |  3. bcrypt.compare(password, password_hash)
+  |                               |  4. Generate access_token (JWT, 15min)
+  |                               |  5. Generate refresh_token (random hex, 7days)
+  |                               |  6. Store SHA-256(refresh_token) in refresh_tokens table
+  |                               |  7. Set both httpOnly cookies
   |  ◄─────────────────────────   |
   |  Set-Cookie: access_token     |
   |  Set-Cookie: refresh_token    |
   |  Body: { user }               |  ← user profile only, NO tokens in body
 ```
 
-### 4.3 OAuth Flow (Google / Microsoft)
-
-**Entirely backend-controlled.** The client only triggers a page navigation. Every redirect, callback, error handling, and final landing is decided by the backend. The client has zero logic for OAuth.
-
-**Client triggers OAuth by navigating the page (not an API call):**
-```html
-<!-- Login page button — just a link, not a fetch() -->
-<a href="/auth/oauth/google">Sign in with Google</a>
-```
-
-```
-Browser                         Server                        Google
-  |                               |                               |
-  | User clicks "Sign in          |                               |
-  | with Google" link             |                               |
-  |                               |                               |
-  | ① Browser navigates to        |                               |
-  |    /auth/oauth/google         |                               |
-  |  ─────────────────────────►   |                               |
-  |                               |  1. Generate state parameter   |
-  |                               |     (random string for CSRF)  |
-  |                               |  2. Generate PKCE code_verifier|
-  |                               |     + code_challenge           |
-  |                               |  3. Store state + code_verifier|
-  |                               |     in a short-lived httpOnly  |
-  |                               |     cookie (5 min expiry)     |
-  |                               |  4. Build Google auth URL with:|
-  |                               |     - client_id               |
-  |                               |     - redirect_uri = /auth/oauth/google/callback |
-  |                               |     - scope = openid email profile |
-  |                               |     - state = <generated>     |
-  |                               |     - code_challenge           |
-  |                               |                               |
-  | ② Backend redirects browser   |                               |
-  |    to Google's login page     |                               |
-  |  ◄── 302 Location: https://   |                               |
-  |       accounts.google.com/    |                               |
-  |       o/oauth2/auth?...       |                               |
-  |  Set-Cookie: oauth_state=...  |                               |
-  |                               |                               |
-  | ③ Browser is now on Google    |                               |
-  |    User logs in / consents    |                               |
-  |  ────────────────────────────────────────────────────────►    |
-  |                               |                               |
-  | ④ Google redirects browser    |                               |
-  |    back to our callback       |                               |
-  |  ◄──────────────────────────────── 302 Location:              |
-  |       /auth/oauth/google/     |    /auth/oauth/google/callback|
-  |       callback?code=xxx       |    ?code=xxx&state=yyy        |
-  |       &state=yyy              |                               |
-  |                               |                               |
-  | ⑤ Browser hits our callback   |                               |
-  |    endpoint (backend)         |                               |
-  |  ─────────────────────────►   |                               |
-  |  Cookie: oauth_state=...      |                               |
-  |                               |  5. Read state from cookie     |
-  |                               |     Compare with ?state param  |
-  |                               |     → mismatch? redirect to    |
-  |                               |       /login?error=oauth_failed|
-  |                               |                               |
-  |                               |  6. Exchange code for tokens   |
-  |                               |     POST to Google token endpoint |
-  |                               |     with code + code_verifier  |
-  |                               |     ──────────────────────►   |
-  |                               |     ◄── { access_token,       |
-  |                               |           id_token }          |
-  |                               |                               |
-  |                               |  7. Fetch user profile from    |
-  |                               |     Google (or decode id_token)|
-  |                               |     → email, name, avatar,    |
-  |                               |       provider_id             |
-  |                               |                               |
-  |                               |  8. Find or create user:       |
-  |                               |     a. Check user_oauth_links  |
-  |                               |        for (google, provider_id)|
-  |                               |     b. Found → existing user   |
-  |                               |        → get user_id           |
-  |                               |     c. Not found:              |
-  |                               |        - Check users table for |
-  |                               |          same email            |
-  |                               |        - Email exists? → link  |
-  |                               |          OAuth to existing user|
-  |                               |        - New email? → create   |
-  |                               |          user + oauth_link     |
-  |                               |        - Set email_verified=   |
-  |                               |          true (Google verified)|
-  |                               |                               |
-  |                               |  9. Store/update Google tokens |
-  |                               |     (encrypted) in             |
-  |                               |     user_oauth_links           |
-  |                               |                               |
-  |                               |  10. Check pending invitations |
-  |                               |      for this email            |
-  |                               |                               |
-  |                               |  11. Generate access_token +   |
-  |                               |      refresh_token             |
-  |                               |      Store refresh hash in DB  |
-  |                               |                               |
-  |                               |  12. Clear oauth_state cookie  |
-  |                               |      Set auth cookies          |
-  |                               |      Redirect to app           |
-  |                               |                               |
-  | ⑥ Backend redirects browser   |                               |
-  |    to the app (final landing) |                               |
-  |  ◄── 302 Location: /dashboard |                               |
-  |  Set-Cookie: access_token=... |                               |
-  |  Set-Cookie: refresh_token=...|                               |
-  |  Set-Cookie: oauth_state=;    |  ← clear the oauth state cookie
-  |              Max-Age=0         |                               |
-  |                               |                               |
-  | ⑦ Browser loads /dashboard    |                               |
-  |    with auth cookies set.     |                               |
-  |    User is logged in.         |                               |
-```
-
-**Key points:**
-- The client's page changes 4 times: our login → Google → our callback → our dashboard. All via 302 redirects. No JavaScript involved.
-- The callback endpoint (`/auth/oauth/google/callback`) is a **backend endpoint** that the browser hits directly. It is NOT an API endpoint called by frontend JS.
-- On success → backend redirects to `/dashboard` (or whatever page we define)
-- On error → backend redirects to `/login?error=<error_code>`
-
-**Error handling — backend decides where to redirect:**
-
-```
-Callback endpoint error scenarios:
-
-| Error                          | Backend redirects to                     |
-|--------------------------------|------------------------------------------|
-| State mismatch (CSRF)          | /login?error=oauth_failed                |
-| Google token exchange fails    | /login?error=oauth_failed                |
-| Google account linked to       | /login?error=account_already_linked      |
-| another BitSync user           |                                          |
-| User's email not verified      | /login?error=email_not_verified          |
-| Any unexpected error           | /login?error=oauth_failed                |
-| Success                        | /dashboard                               |
-```
-
-The frontend login page reads the `?error` query param and shows the appropriate error message. That's the only client-side logic.
-
-**Backend callback implementation:**
-
-```javascript
-router.get('/auth/oauth/google/callback', async (req, res) => {
-    try {
-        const { code, state } = req.query;
-        const storedState = req.cookies.oauth_state;
-
-        // 1. Verify state (CSRF protection)
-        if (!state || !storedState || state !== JSON.parse(storedState).state) {
-            return res.redirect('/login?error=oauth_failed');
-        }
-
-        // 2. Exchange code for tokens
-        const codeVerifier = JSON.parse(storedState).codeVerifier;
-        const googleTokens = await exchangeCodeForTokens(code, codeVerifier);
-
-        // 3. Get user profile
-        const googleUser = await getGoogleUserProfile(googleTokens.access_token);
-
-        // 4. Find or create user
-        let user;
-        const existingLink = await db.query(
-            'SELECT user_id FROM user_oauth_links WHERE provider = $1 AND provider_id = $2',
-            ['google', googleUser.id]
-        );
-
-        if (existingLink) {
-            user = await db.query('SELECT * FROM users WHERE id = $1', [existingLink.user_id]);
-        } else {
-            const existingUser = await db.query('SELECT * FROM users WHERE email = $1', [googleUser.email]);
-            if (existingUser) {
-                user = existingUser;
-            } else {
-                user = await db.query(
-                    'INSERT INTO users (email, display_name, avatar_url, email_verified) VALUES ($1, $2, $3, true) RETURNING *',
-                    [googleUser.email, googleUser.name, googleUser.picture]
-                );
-            }
-            // Link OAuth
-            await db.query(
-                'INSERT INTO user_oauth_links (user_id, provider, provider_id, provider_email, access_token, refresh_token, token_expires) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-                [user.id, 'google', googleUser.id, googleUser.email,
-                 encrypt(googleTokens.access_token), encrypt(googleTokens.refresh_token), googleTokens.expires_at]
-            );
-        }
-
-        // 5. Check pending invitations
-        await linkPendingInvitations(user.id, user.email);
-
-        // 6. Generate auth tokens + set cookies
-        const accessToken = generateAccessToken(user);
-        const refreshToken = crypto.randomBytes(64).toString('hex');
-        await storeRefreshToken(user.id, refreshToken, req.headers['user-agent']);
-
-        setAuthCookies(res, accessToken, refreshToken);
-
-        // 7. Clear oauth state cookie
-        res.cookie('oauth_state', '', { httpOnly: true, maxAge: 0, path: '/' });
-
-        // 8. Redirect to app — backend decides the destination
-        return res.redirect('/dashboard');
-
-    } catch (err) {
-        console.error('OAuth callback error:', err);
-        res.cookie('oauth_state', '', { httpOnly: true, maxAge: 0, path: '/' });
-        return res.redirect('/login?error=oauth_failed');
-    }
-});
-```
-
-### 4.4 Logout
+### 4.3 Logout
 
 ```
 Client                          Server
@@ -482,113 +245,14 @@ Client                          Server
   |              Max-Age=0;Path=/ |
 ```
 
-### 4.5 Linking OAuth to Existing Account (Settings Page)
-
-**Same backend-controlled pattern.** User clicks a link, backend handles everything, backend decides where to redirect.
-
-**Client triggers link by navigating (not an API call):**
-```html
-<!-- Settings page — just a link -->
-<a href="/auth/link/google">Link Google Account</a>
-```
-
-```
-Browser                         Server                        Google
-  |                               |                               |
-  | User clicks "Link Google      |                               |
-  | Account" on settings page     |                               |
-  |                               |                               |
-  | ① Browser navigates to        |                               |
-  |    /auth/link/google          |                               |
-  |  ─────────────────────────►   |                               |
-  |  Cookie: access_token=...     |                               |
-  |                               |  1. Read user from access_token|
-  |                               |     cookie (must be logged in) |
-  |                               |     → not logged in? redirect  |
-  |                               |       to /login                |
-  |                               |  2. Generate state (includes   |
-  |                               |     user_id + action="link")  |
-  |                               |     + PKCE code_verifier       |
-  |                               |  3. Store in oauth_state cookie|
-  |                               |                               |
-  | ② Backend redirects to Google |                               |
-  |  ◄── 302 Location: Google     |                               |
-  |  Set-Cookie: oauth_state=...  |                               |
-  |                               |                               |
-  | ③ User logs in at Google      |                               |
-  |  ────────────────────────────────────────────────────────►    |
-  |                               |                               |
-  | ④ Google redirects to our     |                               |
-  |    link callback              |                               |
-  |  ◄──────────────────────────────── 302 to                     |
-  |                               |    /auth/link/google/callback  |
-  |                               |    ?code=xxx&state=yyy         |
-  |                               |                               |
-  | ⑤ Browser hits callback       |                               |
-  |  ─────────────────────────►   |                               |
-  |  Cookie: oauth_state=...;     |                               |
-  |          access_token=...     |                               |
-  |                               |  4. Verify state               |
-  |                               |  5. Verify user is still       |
-  |                               |     logged in (access_token)   |
-  |                               |  6. Exchange code for tokens   |
-  |                               |  7. Fetch Google profile       |
-  |                               |  8. Check: is this Google      |
-  |                               |     account already linked to  |
-  |                               |     ANOTHER BitSync user?      |
-  |                               |     → Yes: redirect to         |
-  |                               |       /settings?error=         |
-  |                               |       account_already_linked   |
-  |                               |     → No: insert into          |
-  |                               |       user_oauth_links for     |
-  |                               |       current user             |
-  |                               |  9. Clear oauth_state cookie   |
-  |                               |                               |
-  | ⑥ Backend redirects to        |                               |
-  |    settings page              |                               |
-  |  ◄── 302 Location:            |                               |
-  |       /settings?linked=google |                               |
-  |                               |                               |
-  | ⑦ Browser loads settings page |                               |
-  |    Shows "Google linked        |                               |
-  |    successfully"              |                               |
-```
-
-**Error handling — backend redirects:**
-
-```
-| Error                          | Backend redirects to                     |
-|--------------------------------|------------------------------------------|
-| Not logged in                  | /login                                   |
-| State mismatch                 | /settings?error=link_failed              |
-| Google account already linked  | /settings?error=account_already_linked   |
-| to another user                |                                          |
-| Token exchange fails           | /settings?error=link_failed              |
-| Success                        | /settings?linked=google                  |
-```
-
-### 4.6 Setting a Password (for OAuth-only users)
-
-```
-POST /auth/set-password
-{ new_password }
-Cookie: access_token=...            ← browser sends automatically
-
-→ Read user from access_token cookie
-→ Validate password strength
-→ Hash with bcrypt
-→ UPDATE users SET password_hash = $hash WHERE id = $user_id
-→ Now user can log in with email + password too
-```
-
-### 4.7 Forgot / Reset Password
+### 4.4 Forgot / Reset Password
 
 ```
 POST /auth/forgot-password
 { email }
 
 → Find user by email
-→ If user exists AND password_hash is NOT NULL:
+→ If user exists:
     Generate a password reset token (signed JWT, 1-hour expiry)
     Send email with reset link
 → Always return { message: "If the email exists, a reset link was sent" }
@@ -607,7 +271,7 @@ POST /auth/reset-password
 → Return success (user must log in again)
 ```
 
-### 4.8 Page Refresh / New Tab
+### 4.5 Page Refresh / New Tab
 
 ```
 User refreshes the page or opens a new tab
@@ -693,186 +357,6 @@ Refresh logic (access_token expired or missing, refresh_token exists):
       Client receives data + updated cookies in a single response
 ```
 
-### Implementation
-
-```javascript
-const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
-
-async function authenticate(req, res, next) {
-    const accessToken = req.cookies.access_token;
-    const refreshToken = req.cookies.refresh_token;
-
-    // ── No tokens at all → not logged in ──
-    if (!accessToken && !refreshToken) {
-        return res.status(401).json({ error: 'Not authenticated' });
-    }
-
-    // ── Try access token first ──
-    if (accessToken) {
-        try {
-            const payload = jwt.verify(accessToken, process.env.JWT_SECRET);
-            req.user = { id: payload.sub, email: payload.email, name: payload.name };
-            return next();  // ✓ access token valid, no refresh needed
-        } catch (err) {
-            if (err.name !== 'TokenExpiredError') {
-                // Tampered or malformed — not just expired
-                clearAuthCookies(res);
-                return res.status(401).json({ error: 'Invalid token' });
-            }
-            // Expired → fall through to refresh logic
-        }
-    }
-
-    // ── Access token expired (or missing) → try server-side refresh ──
-    if (!refreshToken) {
-        clearAuthCookies(res);
-        return res.status(401).json({ error: 'Session expired, please log in again' });
-    }
-
-    try {
-        // 1. Hash the refresh token from the cookie
-        const tokenHash = crypto
-            .createHash('sha256')
-            .update(refreshToken)
-            .digest('hex');
-
-        // 2. Look up in DB
-        const stored = await db.query(
-            'SELECT * FROM refresh_tokens WHERE token_hash = $1',
-            [tokenHash]
-        );
-
-        // 3. Not found
-        if (!stored) {
-            clearAuthCookies(res);
-            return res.status(401).json({ error: 'Invalid session' });
-        }
-
-        // 4. Already revoked → possible theft
-        if (stored.revoked) {
-            const revokedAgo = Date.now() - new Date(stored.revoked_at).getTime();
-
-            if (revokedAgo < 10_000) {
-                // Revoked less than 10 seconds ago → likely a concurrent request
-                // The other request already issued new tokens
-                // This request just needs to retry (client will have new cookies by then)
-                return res.status(401).json({
-                    error: 'Session refreshed by another request, please retry'
-                });
-            }
-
-            // Revoked more than 10 seconds ago → real theft
-            await db.query(
-                'UPDATE refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE user_id = $1 AND revoked = FALSE',
-                [stored.user_id]
-            );
-            clearAuthCookies(res);
-            return res.status(401).json({
-                error: 'Session compromised. All sessions have been revoked. Please log in again.'
-            });
-        }
-
-        // 5. Expired
-        if (new Date(stored.expires_at) < new Date()) {
-            clearAuthCookies(res);
-            return res.status(401).json({ error: 'Session expired, please log in again' });
-        }
-
-        // 6. VALID — rotate tokens
-
-        // Revoke the old refresh token
-        await db.query(
-            'UPDATE refresh_tokens SET revoked = TRUE, revoked_at = NOW() WHERE id = $1',
-            [stored.id]
-        );
-
-        // Fetch user info for new JWT
-        const user = await db.query(
-            'SELECT id, email, display_name FROM users WHERE id = $1',
-            [stored.user_id]
-        );
-
-        if (!user) {
-            clearAuthCookies(res);
-            return res.status(401).json({ error: 'User not found' });
-        }
-
-        // Generate new access token (JWT)
-        const newAccessToken = jwt.sign(
-            { sub: user.id, email: user.email, name: user.display_name },
-            process.env.JWT_SECRET,
-            { expiresIn: '15m' }
-        );
-
-        // Generate new refresh token (random string)
-        const newRefreshToken = crypto.randomBytes(64).toString('hex');
-        const newTokenHash = crypto
-            .createHash('sha256')
-            .update(newRefreshToken)
-            .digest('hex');
-
-        // Store new refresh token hash in DB
-        await db.query(
-            'INSERT INTO refresh_tokens (user_id, token_hash, device_info, expires_at) VALUES ($1, $2, $3, $4)',
-            [user.id, newTokenHash, stored.device_info, new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)]
-        );
-
-        // Set new cookies on the response
-        setAuthCookies(res, newAccessToken, newRefreshToken);
-
-        // Set req.user so the controller works normally
-        req.user = { id: user.id, email: user.email, name: user.display_name };
-
-        return next();  // ✓ refreshed, proceed to controller
-
-    } catch (err) {
-        clearAuthCookies(res);
-        return res.status(401).json({ error: 'Authentication failed' });
-    }
-}
-```
-
-### Cookie Helpers
-
-```javascript
-function setAuthCookies(res, accessToken, refreshToken) {
-    res.cookie('access_token', accessToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
-        path: '/',
-        maxAge: 15 * 60 * 1000              // 15 minutes
-    });
-
-    res.cookie('refresh_token', refreshToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
-        path: '/',                           // ← same as access_token, needed for server-side refresh
-        maxAge: 7 * 24 * 60 * 60 * 1000     // 7 days
-    });
-}
-
-function clearAuthCookies(res) {
-    res.cookie('access_token', '', {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
-        path: '/',
-        maxAge: 0
-    });
-
-    res.cookie('refresh_token', '', {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
-        path: '/',
-        maxAge: 0
-    });
-}
-```
-
 ### What the Client Sees
 
 ```
@@ -916,18 +400,12 @@ Solution:
 
 ### Public Routes (skip auth middleware)
 
-```javascript
-const PUBLIC_ROUTES = [
-    'POST /auth/register',
-    'POST /auth/login',
-    'GET  /auth/verify-email',
-    'POST /auth/forgot-password',
-    'POST /auth/reset-password',
-    'GET  /auth/oauth/google',
-    'GET  /auth/oauth/google/callback',
-    'GET  /auth/oauth/microsoft',
-    'GET  /auth/oauth/microsoft/callback',
-];
+```
+POST /auth/register
+POST /auth/login
+GET  /auth/verify-email
+POST /auth/forgot-password
+POST /auth/reset-password
 ```
 
 ---
@@ -942,13 +420,10 @@ POST   /auth/login                       — email + password login → sets coo
 POST   /auth/logout                      — revoke tokens → clears cookies
 POST   /auth/forgot-password             — send password reset email
 POST   /auth/reset-password              — reset password → clears cookies (force re-login)
-POST   /auth/set-password                — set password for OAuth users [authenticated]
-DELETE /auth/link/:provider              — unlink OAuth provider [authenticated]
 
 GET    /users/me                         — get current user profile [authenticated]
 PATCH  /users/me                         — update profile (name, avatar) [authenticated]
 GET    /users/me/repos                   — list repos user is member of [authenticated]
-GET    /users/me/oauth-links             — list linked OAuth providers [authenticated]
 GET    /users/me/sessions                — list active sessions [authenticated]
 DELETE /users/me/sessions/:id            — revoke a specific session [authenticated]
 ```
@@ -959,19 +434,9 @@ These are full page navigations triggered by `<a href="...">` links or `window.l
 
 ```
 GET    /auth/verify-email?token=xxx      — verify email → sets cookies → 302 to /dashboard
-GET    /auth/oauth/google                — start Google login → 302 to Google
-GET    /auth/oauth/google/callback       — Google callback → sets cookies → 302 to /dashboard or /login?error=...
-GET    /auth/oauth/microsoft             — start Microsoft login → 302 to Microsoft
-GET    /auth/oauth/microsoft/callback    — Microsoft callback → sets cookies → 302 to /dashboard or /login?error=...
-GET    /auth/link/google                 — start Google link → 302 to Google [authenticated]
-GET    /auth/link/google/callback        — link callback → 302 to /settings?linked=google or /settings?error=...
-GET    /auth/link/microsoft              — start Microsoft link → 302 to Microsoft [authenticated]
-GET    /auth/link/microsoft/callback     — link callback → 302 to /settings?linked=microsoft or /settings?error=...
 ```
 
 **No `/auth/refresh` endpoint.** Token refresh is handled transparently by the auth middleware on every protected route.
-
-**No client-side OAuth logic.** The client triggers OAuth with a link (`<a href="/auth/oauth/google">`), and the backend handles everything: redirect to provider, callback processing, user creation, cookie setting, and final redirect to the app. The client only reads `?error` or `?linked` query params to show status messages.
 
 ---
 
@@ -986,18 +451,6 @@ GET    /auth/link/microsoft/callback     — link callback → 302 to /settings?
 | File uploads            | 20 requests        | 1 min  | User ID    |
 ```
 
-```javascript
-const authLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 10,
-    keyGenerator: (req) => req.ip,
-    message: { error: 'Too many attempts, try again later' }
-});
-
-app.use('/auth/login', authLimiter);
-app.use('/auth/register', authLimiter);
-```
-
 ---
 
 ## 8. Cleanup Job
@@ -1006,14 +459,7 @@ Revoked and expired refresh tokens accumulate in the DB over time. A scheduled j
 
 ### What Gets Cleaned Up
 
-```sql
--- Tokens that are safe to delete:
--- 1. Revoked tokens older than 30 days (kept for 30 days for audit trail)
--- 2. Expired tokens older than 30 days (user never came back to refresh)
-DELETE FROM refresh_tokens
-WHERE created_at < NOW() - INTERVAL '30 days'
-AND (revoked = TRUE OR expires_at < NOW());
-```
+A scheduled job (e.g. daily at 3:00 AM) deletes refresh token rows where `created_at` is older than 30 days **and** the token is either revoked or past its `expires_at`. Active tokens are never touched.
 
 ### Why 30 Days (Not Immediately)
 
@@ -1021,26 +467,6 @@ AND (revoked = TRUE OR expires_at < NOW());
 - **Theft investigation**: The `revoked_at` timestamps show the exact sequence of events
 - **Concurrent request grace period**: Freshly revoked tokens (< 10 sec) are still referenced by the middleware
 - After 30 days, tokens have no forensic or operational value → safe to delete
-
-### Implementation (node-cron)
-
-```javascript
-const cron = require('node-cron');
-
-// Run daily at 3:00 AM
-cron.schedule('0 3 * * *', async () => {
-    try {
-        const result = await db.query(`
-            DELETE FROM refresh_tokens
-            WHERE created_at < NOW() - INTERVAL '30 days'
-            AND (revoked = TRUE OR expires_at < NOW())
-        `);
-        console.log(`[Cleanup] Deleted ${result.rowCount} expired/revoked refresh tokens`);
-    } catch (err) {
-        console.error('[Cleanup] Failed to clean refresh tokens:', err);
-    }
-});
-```
 
 ### Expected Impact
 
@@ -1078,28 +504,17 @@ With daily cleanup (30-day retention):
 - Access tokens: short-lived (15 min), self-validating (JWT), not stored in DB
 - Refresh tokens: random strings, stored as SHA-256 hash in DB, single-use with rotation
 - Refresh token reuse detection: revoked token reused after 10s grace period → revoke ALL user sessions
-- OAuth provider tokens: encrypted at rest in DB (AES-256-GCM)
 
 ### API Security
 - All endpoints over HTTPS (required for Secure cookies)
-- CORS configured for specific frontend origin only, with `credentials: true`
+- CORS configured for specific frontend origin only, with `credentials: true` (required for cross-origin cookies)
 - Helmet.js for security headers (X-Frame-Options, CSP, HSTS, etc.)
 - Input validation on all endpoints (zod schemas)
 - SQL injection prevented by parameterized queries (never string concat)
 
-### CORS Configuration (required for cookies)
-
-```javascript
-app.use(cors({
-    origin: process.env.FRONTEND_URL,   // e.g., 'https://bitsync.app'
-    credentials: true                    // required for cross-origin cookies
-}));
-```
-
 ### Session Management
 - On password change → revoke ALL refresh tokens → clear cookies (force re-login everywhere)
 - On account deletion → revoke all tokens, remove all memberships, clear cookies
-- On OAuth unlink → delete oauth_link row
 - Sessions page: user can see active sessions (device_info) and revoke individually
 
 ### Email Security
