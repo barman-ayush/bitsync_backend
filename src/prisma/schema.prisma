@@ -22,6 +22,25 @@ model User {
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
+  refreshTokens RefreshToken[]
+
   @@index([email])
   @@map("users")
+}
+
+model RefreshToken {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String    @db.Uuid @map("user_id")
+  tokenHash  String    @unique @db.VarChar(255) @map("token_hash")
+  deviceInfo String?   @db.VarChar(255) @map("device_info")
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz
+  revoked    Boolean   @default(false)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_tokens")
 }
