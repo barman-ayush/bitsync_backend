@@ -2,7 +2,7 @@ import { NextFunction, Request, Response } from 'express';
 import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import { handleError } from '../middlewares/error.middleware';
-import { BadRequestError, ConflictError, NotFoundError, UnauthorizedError } from '../errors/app.error';
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from '../errors/app.error';
 import { loginSchema, registerSchema } from '../validators/auth.validator';
 import db from '../services/database.service';
 import tokenService from '../services/token.service';
@@ -42,7 +42,7 @@ export class AuthController {
             });
 
             const verifyToken = tokenService.generateVerifyEmailToken(email);
-            const verifyLink = `${process.env.CLIENT_URL}/api/auth/verify-email?token=${verifyToken}`;
+            const verifyLink = `${process.env.BACKEND_URL}/api/auth/verify-email?token=${verifyToken}`;
             await mailService.sendMail(email, "Verify your email", verifyEmailTemplate(name, verifyLink));
             
             res.status(200).json({
@@ -111,30 +111,30 @@ export class AuthController {
         try {
             const parsed = loginSchema.safeParse(req.body);
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
-
+            
             const { email, password } = parsed.data;
-
+            
             const user = await db.prisma.user.findUnique({ where: { email } });
-
+            
             if (!user) throw new NotFoundError("No user with given email found.");
-
+            
             if (!user.passwordHash) {
                 throw new BadRequestError(
                     "This account uses OAuth. Login with Google/Microsoft or set a password in settings."
                 );
             }
-
+            
             if (!user.emailVerified) {
                 const verifyToken = tokenService.generateVerifyEmailToken(user.email);
-                const verifyLink = `${process.env.CLIENT_URL}/api/auth/verify-email?token=${verifyToken}`;
+                const verifyLink = `${process.env.BACKEND_URL}/api/auth/verify-email?token=${verifyToken}`;
                 await mailService.sendMail(user.email, "Verify your email", verifyEmailTemplate(user.displayName, verifyLink));
 
-                return res.redirect(`${feUrls.verifyEmail}?toast="Email has been sent please verify"`);
+                throw new ForbiddenError("Email not verified. Verification email has been sent.", "EMAIL_NOT_VERIFIED");
             }
-
+            
             const isValid = await bcrypt.compare(password, user.passwordHash);
             if (!isValid) throw new UnauthorizedError("Invalid email or password.");
-
+            
             const accessToken = tokenService.generateAccessToken(user);
             const { token: refreshToken, hash: refreshTokenHash } = tokenService.generateRefreshToken();
 
@@ -146,10 +146,10 @@ export class AuthController {
                     expiresAt: new Date(Date.now() + REFRESH_TOKEN_MAX_AGE_MS),
                 },
             });
-
+            
             res.cookie("access_token", accessToken, { ...AUTH_COOKIE_OPTIONS, maxAge: ACCESS_TOKEN_MAX_AGE_MS });
             res.cookie("refresh_token", refreshToken, { ...AUTH_COOKIE_OPTIONS, maxAge: REFRESH_TOKEN_MAX_AGE_MS });
-
+            
             res.status(200).json({
                 status: "success",
                 message: "Logged in successfully.",
@@ -162,32 +162,54 @@ export class AuthController {
                     createdAt  : user.createdAt
                 },
             });
-
+            
         } catch (err) {
             handleError("api/auth/login", err, next);
         }
     }
-
+    
     static async logout(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             const refreshToken = req.cookies?.refresh_token;
 
             if (refreshToken) {
                 const tokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
-
+                
                 await db.prisma.refreshToken.updateMany({
                     where: { tokenHash, revoked: false },
                     data: { revoked: true, revokedAt: new Date() },
                 });
             }
-
+            
             res.clearCookie("access_token", AUTH_COOKIE_OPTIONS);
             res.clearCookie("refresh_token", AUTH_COOKIE_OPTIONS);
-
+            
             return res.redirect(`${feUrls.home}?toast="Logged out successfully"`);
-
+            
         } catch (err) {
             handleError("api/auth/logout", err, next);
+        }
+    }
+
+    static async sendEmail(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Not authenticated");
+
+            const user = await db.prisma.user.findUnique({ where: { id: req.user.sub } });
+            if (!user) throw new NotFoundError("User not found");
+
+            if (user.emailVerified) {
+                res.status(200).json({ status: "success", message: "Email is already verified." });
+                return;
+            }
+
+            const verifyToken = tokenService.generateVerifyEmailToken(user.email);
+            const verifyLink = `${process.env.BACKEND_URL}/api/auth/verify-email?token=${verifyToken}`;
+            await mailService.sendMail(user.email, "Verify your email", verifyEmailTemplate(user.displayName, verifyLink));
+
+            res.status(200).json({ status: "success", message: "Verification email sent." });
+        } catch (err) {
+            handleError("api/auth/send-email", err, next);
         }
     }
 }

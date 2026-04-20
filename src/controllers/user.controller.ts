@@ -27,7 +27,7 @@ export class UserDataController {
                 data: user,
             });
         } catch (err) {
-            handleError("[api/user/me]", err, next);
+            handleError("api/user/data", err, next);
         }
     }
 }

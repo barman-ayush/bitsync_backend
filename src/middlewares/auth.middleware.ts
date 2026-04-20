@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import tokenService from "../services/token.service";
 import db from "../services/database.service";
 import logger from "../services/logger.service";
-import { feUrls } from "../config/fe-urls";
+import { ForbiddenError, UnauthorizedError } from "../errors/app.error";
 import {
     ACCESS_TOKEN_MAX_AGE_MS,
     AUTH_COOKIE_OPTIONS,
@@ -10,14 +10,6 @@ import {
     REFRESH_TOKEN_MAX_AGE_MS,
 } from "../config/auth.config";
 import { AccessTokenPayload } from "../types/jwt.types";
-
-const TOAST = {
-    notAuthenticated: `${feUrls.home}?toast="Please login to continue"`,
-    sessionExpired: `${feUrls.home}?toast="Session expired, please login again"`,
-    invalidSession: `${feUrls.home}?toast="Invalid session, please login again"`,
-    pleaseRetry: `${feUrls.home}?toast="Please retry"`,
-    compromised: `${feUrls.home}?toast="Session compromised, all sessions revoked"`,
-};
 
 function clearAuthCookies(res: Response): void {
     res.clearCookie("access_token", AUTH_COOKIE_OPTIONS);
@@ -36,7 +28,7 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
 
         // No tokens at all
         if (!accessToken && !refreshToken) {
-            return res.redirect(TOAST.notAuthenticated);
+            throw new UnauthorizedError("Please login to continue");
         }
 
         // Try access token first
@@ -50,7 +42,7 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
 
             if (result.status === "invalid") {
                 clearAuthCookies(res);
-                return res.redirect(TOAST.invalidSession);
+                throw new UnauthorizedError("Invalid session, please login again");
             }
             // status === "expired" → fall through to refresh logic
         }
@@ -58,7 +50,7 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
         // Refresh logic — needs a refresh token
         if (!refreshToken) {
             clearAuthCookies(res);
-            return res.redirect(TOAST.notAuthenticated);
+            throw new UnauthorizedError("Please login to continue");
         }
 
         const tokenHash = tokenService.hashRefreshToken(refreshToken);
@@ -66,7 +58,7 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
 
         if (!stored) {
             clearAuthCookies(res);
-            return res.redirect(TOAST.invalidSession);
+            throw new UnauthorizedError("Invalid session, please login again");
         }
 
         if (stored.revoked) {
@@ -76,7 +68,7 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
 
             if (revokedAgoMs < CONCURRENT_REFRESH_GRACE_MS) {
                 // Concurrent request — another request just rotated this token
-                return res.redirect(TOAST.pleaseRetry);
+                throw new UnauthorizedError("Please retry");
             }
 
             // Theft detected — revoke ALL tokens for this user
@@ -86,19 +78,24 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
             });
             clearAuthCookies(res);
             logger.warn("[auth.middleware]", `Refresh token reuse detected for user ${stored.userId}`);
-            return res.redirect(TOAST.compromised);
+            throw new UnauthorizedError("Session compromised, all sessions revoked");
         }
 
         if (stored.expiresAt.getTime() <= Date.now()) {
             clearAuthCookies(res);
-            return res.redirect(TOAST.sessionExpired);
+            throw new UnauthorizedError("Session expired, please login again");
         }
 
         // Valid refresh token — rotate
         const user = await db.prisma.user.findUnique({ where: { id: stored.userId } });
         if (!user) {
             clearAuthCookies(res);
-            return res.redirect(TOAST.invalidSession);
+            throw new UnauthorizedError("Invalid session, please login again");
+        }
+
+        if (!user.emailVerified) {
+            clearAuthCookies(res);
+            throw new ForbiddenError("Email not verified", "EMAIL_NOT_VERIFIED");
         }
 
         const newAccessToken = tokenService.generateAccessToken(user);
@@ -125,8 +122,6 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
         req.user = payload;
         return next();
     } catch (err) {
-        logger.error("[auth.middleware]", err instanceof Error ? err.message : String(err));
-        clearAuthCookies(res);
-        return res.redirect(TOAST.invalidSession);
+        next(err);
     }
 }

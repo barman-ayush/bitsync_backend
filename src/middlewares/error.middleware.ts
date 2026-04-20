@@ -13,6 +13,7 @@ export function errorMiddleware(err: Error, req: Request, res: Response, next: N
         res.status(err.statusCode).json({
             status: "error",
             message: err.message,
+            ...(err.code && { code: err.code }),
         });
         return;
     }
