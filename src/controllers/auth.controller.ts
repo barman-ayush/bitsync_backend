@@ -44,7 +44,7 @@ export class AuthController {
             const verifyToken = tokenService.generateVerifyEmailToken(email);
             const verifyLink = `${process.env.BACKEND_URL}/api/auth/verify-email?token=${verifyToken}`;
             await mailService.sendMail(email, "Verify your email", verifyEmailTemplate(name, verifyLink));
-            
+
             res.status(200).json({
                 status: "success",
                 message: "User registered successfully. Please check your email to verify.",
@@ -52,9 +52,9 @@ export class AuthController {
                     id: user.id,
                     email: user.email,
                     displayName: user.displayName,
-                    avatarUrl : user.avatarUrl,
-                    emailVerified : user.emailVerified,
-                    createdAt  : user.createdAt
+                    avatarUrl: user.avatarUrl,
+                    emailVerified: user.emailVerified,
+                    createdAt: user.createdAt
                 },
             });
 
@@ -111,19 +111,19 @@ export class AuthController {
         try {
             const parsed = loginSchema.safeParse(req.body);
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
-            
+
             const { email, password } = parsed.data;
-            
+
             const user = await db.prisma.user.findUnique({ where: { email } });
-            
+
             if (!user) throw new NotFoundError("No user with given email found.");
-            
+
             if (!user.passwordHash) {
                 throw new BadRequestError(
                     "This account uses OAuth. Login with Google/Microsoft or set a password in settings."
                 );
             }
-            
+
             if (!user.emailVerified) {
                 const verifyToken = tokenService.generateVerifyEmailToken(user.email);
                 const verifyLink = `${process.env.BACKEND_URL}/api/auth/verify-email?token=${verifyToken}`;
@@ -131,10 +131,10 @@ export class AuthController {
 
                 throw new ForbiddenError("Email not verified. Verification email has been sent.", "EMAIL_NOT_VERIFIED");
             }
-            
+
             const isValid = await bcrypt.compare(password, user.passwordHash);
             if (!isValid) throw new UnauthorizedError("Invalid email or password.");
-            
+
             const accessToken = tokenService.generateAccessToken(user);
             const { token: refreshToken, hash: refreshTokenHash } = tokenService.generateRefreshToken();
 
@@ -146,10 +146,10 @@ export class AuthController {
                     expiresAt: new Date(Date.now() + REFRESH_TOKEN_MAX_AGE_MS),
                 },
             });
-            
+
             res.cookie("access_token", accessToken, { ...AUTH_COOKIE_OPTIONS, maxAge: ACCESS_TOKEN_MAX_AGE_MS });
             res.cookie("refresh_token", refreshToken, { ...AUTH_COOKIE_OPTIONS, maxAge: REFRESH_TOKEN_MAX_AGE_MS });
-            
+
             res.status(200).json({
                 status: "success",
                 message: "Logged in successfully.",
@@ -157,35 +157,34 @@ export class AuthController {
                     id: user.id,
                     email: user.email,
                     displayName: user.displayName,
-                    avatarUrl : user.avatarUrl,
-                    emailVerified : user.emailVerified,
-                    createdAt  : user.createdAt
+                    avatarUrl: user.avatarUrl,
+                    emailVerified: user.emailVerified,
+                    createdAt: user.createdAt
                 },
             });
-            
+
         } catch (err) {
             handleError("api/auth/login", err, next);
         }
     }
-    
+
     static async logout(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             const refreshToken = req.cookies?.refresh_token;
 
             if (refreshToken) {
                 const tokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
-                
+
                 await db.prisma.refreshToken.updateMany({
                     where: { tokenHash, revoked: false },
                     data: { revoked: true, revokedAt: new Date() },
                 });
             }
-            
+
             res.clearCookie("access_token", AUTH_COOKIE_OPTIONS);
             res.clearCookie("refresh_token", AUTH_COOKIE_OPTIONS);
-            
-            return res.redirect(`${feUrls.home}?toast="Logged out successfully"`);
-            
+
+            res.status(200).json({ status: "success", message: "Logged Out successfully !!" });
         } catch (err) {
             handleError("api/auth/logout", err, next);
         }

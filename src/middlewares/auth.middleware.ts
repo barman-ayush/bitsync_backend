@@ -10,6 +10,7 @@ import {
     REFRESH_TOKEN_MAX_AGE_MS,
 } from "../config/auth.config";
 import { AccessTokenPayload } from "../types/jwt.types";
+import { handleError } from "./error.middleware";
 
 function clearAuthCookies(res: Response): void {
     res.clearCookie("access_token", AUTH_COOKIE_OPTIONS);
@@ -122,6 +123,6 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
         req.user = payload;
         return next();
     } catch (err) {
-        next(err);
+        handleError("Auth Middleware", err, next)
     }
 }

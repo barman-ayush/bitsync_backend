@@ -22,7 +22,11 @@ model User {
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
   updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
-  refreshTokens RefreshToken[]
+  refreshTokens        RefreshToken[]
+  ownedRepos           Repository[]   @relation("RepoOwner")
+  repoMemberships      RepoMember[]
+  sentInvitations      Invitations[]  @relation("InvitationInviter")
+  receivedInvitations  Invitations[]  @relation("InvitationInvitee")
 
   @@index([email])
   @@map("users")
@@ -43,4 +47,68 @@ model RefreshToken {
   @@index([userId])
   @@index([tokenHash])
   @@map("refresh_tokens")
+}
+
+model Repository {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String   @db.VarChar(255)
+  description String?  @db.Text
+  ownerId     String   @db.Uuid @map("owner_id")
+  headCommit  String?  @db.Text @map("head_commit")
+  isDeleted   Boolean  @default(false) @map("is_deleted")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  owner       User          @relation("RepoOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  members     RepoMember[]
+  invitations Invitations[]
+
+  @@unique([ownerId, name])
+  @@index([ownerId])
+  @@map("repositories")
+}
+
+enum RepoRole {
+  owner
+  admin
+  member
+
+  @@map("repo_role")
+}
+
+model RepoMember {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  repoId    String    @db.Uuid @map("repo_id")
+  userId    String    @db.Uuid @map("user_id")
+  role      RepoRole  @default(member)
+  joinedAt  DateTime  @default(now()) @map("joined_at") @db.Timestamptz
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz
+
+  repo Repository @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  user User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([repoId, userId])
+  @@index([repoId])
+  @@index([userId])
+  @@map("repo_members")
+}
+
+model Invitations {
+  id           String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  repoId       String            @db.Uuid @map("repo_id")
+  inviterId    String            @db.Uuid @map("inviter_id")
+  inviteeId    String?           @db.Uuid @map("invitee_id")
+  inviteeEmail String            @db.VarChar(255) @map("invitee_email")
+  role         RepoRole          @default(member)
+  expiresAt    DateTime          @default(dbgenerated("NOW() + INTERVAL '7 days'")) @map("expires_at") @db.Timestamptz
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz
+
+  repo    Repository @relation(fields: [repoId], references: [id], onDelete: Cascade)
+  inviter User       @relation("InvitationInviter", fields: [inviterId], references: [id], onDelete: Cascade)
+  invitee User?      @relation("InvitationInvitee", fields: [inviteeId], references: [id], onDelete: Cascade)
+
+  @@unique([repoId, inviteeEmail])
+  @@index([inviteeId])
+  @@index([inviteeEmail])
+  @@map("invitations")
 }

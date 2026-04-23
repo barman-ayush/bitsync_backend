@@ -1,6 +1,6 @@
 # Prisma - Database Schema Management
 
-## After any schema change (`schema.prisma`)
+## After any schema change (`schema.prisma`) - Local DB 
 
 1. **Create and apply migration:**
    ```bash
@@ -8,7 +8,7 @@
    ```
    This creates a `.sql` migration file and auto-runs `prisma generate`.
 
-2. **If you only need to regenerate the client** (no DB changes):
+2. **Generate the DB schema changes to the local DB**:
    ```bash
    npx prisma generate
    ```
