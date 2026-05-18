@@ -18,17 +18,26 @@ export class RepoController {
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
 
             const { name, description } = parsed.data;
+            const nameNormalized = name.toLowerCase();
             const ownerId = req.user.sub;
 
-            const repo = await db.prisma.$transaction(async (tx) => {
-                const created = await tx.repository.create({
-                    data: { name, description, ownerId },
+            let repo;
+            try {
+                repo = await db.prisma.$transaction(async (tx) => {
+                    const created = await tx.repository.create({
+                        data: { name, nameNormalized, description, ownerId },
+                    });
+                    await tx.repoMember.create({
+                        data: { repoId: created.id, userId: ownerId, role: "owner" },
+                    });
+                    return created;
                 });
-                await tx.repoMember.create({
-                    data: { repoId: created.id, userId: ownerId, role: "owner" },
-                });
-                return created;
-            });
+            } catch (err) {
+                if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+                    throw new ConflictError("You already have a repository with this name.");
+                }
+                throw err;
+            }
 
             res.status(201).json({
                 status: "success",
@@ -57,11 +66,20 @@ export class RepoController {
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
 
             const { name, description } = parsed.data;
+            const nameNormalized = name.toLowerCase();
 
-            const repo = await db.prisma.repository.update({
-                where: { id: repoId as string },
-                data: { name, description: description ?? null },
-            });
+            let repo;
+            try {
+                repo = await db.prisma.repository.update({
+                    where: { id: repoId as string },
+                    data: { name, nameNormalized, description: description ?? null },
+                });
+            } catch (err) {
+                if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+                    throw new ConflictError("You already have a repository with this name.");
+                }
+                throw err;
+            }
 
             res.status(200).json({
                 status: "success",

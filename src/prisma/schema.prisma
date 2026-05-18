@@ -13,14 +13,16 @@ datasource db {
 }
 
 model User {
-  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  email         String   @unique @db.VarChar(255)
-  displayName   String   @db.VarChar(100) @map("display_name")
-  avatarUrl     String?  @map("avatar_url")
-  passwordHash  String?  @map("password_hash")  // NULL if user signed up via OAuth only
-  emailVerified Boolean  @default(false) @map("email_verified")
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email              String   @unique @db.VarChar(255)
+  username           String   @db.VarChar(39)
+  usernameNormalized String   @unique @db.VarChar(39) @map("username_normalized")
+  displayName        String   @db.VarChar(100) @map("display_name")
+  avatarUrl          String?  @map("avatar_url")
+  passwordHash       String?  @map("password_hash")  // NULL if user signed up via OAuth only
+  emailVerified      Boolean  @default(false) @map("email_verified")
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
   refreshTokens        RefreshToken[]
   ownedRepos           Repository[]   @relation("RepoOwner")
@@ -50,20 +52,21 @@ model RefreshToken {
 }
 
 model Repository {
-  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  name        String   @db.VarChar(255)
-  description String?  @db.Text
-  ownerId     String   @db.Uuid @map("owner_id")
-  headCommit  String?  @db.Text @map("head_commit")
-  isDeleted   Boolean  @default(false) @map("is_deleted")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String   @db.VarChar(255)
+  nameNormalized String   @db.VarChar(255) @map("name_normalized")
+  description    String?  @db.Text
+  ownerId        String   @db.Uuid @map("owner_id")
+  headCommit     String?  @db.Text @map("head_commit")
+  isDeleted      Boolean  @default(false) @map("is_deleted")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
   owner       User          @relation("RepoOwner", fields: [ownerId], references: [id], onDelete: Cascade)
   members     RepoMember[]
   invitations Invitations[]
 
-  @@unique([ownerId, name])
+  @@unique([ownerId, nameNormalized])
   @@index([ownerId])
   @@map("repositories")
 }

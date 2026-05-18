@@ -5,6 +5,7 @@ import { authMiddleware } from "../middlewares/auth.middleware";
 
 const router = Router();
 
+router.get("/check-username/:username", UserDataController.checkUsernameAvailability);
 router.get("/data" , authMiddleware , UserDataController.getUser);
 
 

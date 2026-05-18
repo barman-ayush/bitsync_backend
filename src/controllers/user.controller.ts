@@ -1,7 +1,8 @@
 import { NextFunction, Request, Response } from "express";
 import { handleError } from "../middlewares/error.middleware";
-import { NotFoundError, UnauthorizedError } from "../errors/app.error";
+import { BadRequestError, NotFoundError, UnauthorizedError } from "../errors/app.error";
 import db from "../services/database.service";
+import { usernameSchema } from "../validators/auth.validator";
 
 export class UserDataController {
     public static async getUser(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -13,6 +14,7 @@ export class UserDataController {
                 select: {
                     id: true,
                     email: true,
+                    username: true,
                     displayName: true,
                     avatarUrl: true,
                     emailVerified: true,
@@ -28,6 +30,26 @@ export class UserDataController {
             });
         } catch (err) {
             handleError("api/user/data", err, next);
+        }
+    }
+
+    public static async checkUsernameAvailability(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            const parsed = usernameSchema.safeParse(req.params.username);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const existing = await db.prisma.user.findUnique({
+                where: { usernameNormalized: parsed.data.toLowerCase() },
+                select: { id: true },
+            });
+
+
+            res.status(200).json({
+                status: "success",
+                data: { username: parsed.data, available: (existing == null) },
+            });
+        } catch (err) {
+            handleError("api/user/check-username", err, next);
         }
     }
 }

@@ -23,27 +23,34 @@ export class AuthController {
             const parsed = registerSchema.safeParse(req.body);
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
 
-            const { email, password, name } = parsed.data;
+            const { email, username, password } = parsed.data;
+            const usernameNormalized = username.toLowerCase();
 
-            const getUser = await db.prisma.user.findUnique({
-                where: { email }
+            const existing = await db.prisma.user.findFirst({
+                where: { OR: [{ email }, { usernameNormalized }] },
+                select: { email: true, usernameNormalized: true },
             });
 
-            if (getUser) throw new ConflictError("User with this email already exists.");
+            if (existing) {
+                if (existing.email === email) throw new ConflictError("User with this email already exists.");
+                throw new ConflictError("Username is already taken.");
+            }
 
             const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
 
             const user = await db.prisma.user.create({
                 data: {
                     email,
-                    displayName: name,
+                    username,
+                    usernameNormalized,
+                    displayName: username,
                     passwordHash,
                 },
             });
 
             const verifyToken = tokenService.generateVerifyEmailToken(email);
             const verifyLink = `${process.env.BACKEND_URL}/api/auth/verify-email?token=${verifyToken}`;
-            await mailService.sendMail(email, "Verify your email", verifyEmailTemplate(name, verifyLink));
+            await mailService.sendMail(email, "Verify your email", verifyEmailTemplate(username, verifyLink));
 
             res.status(200).json({
                 status: "success",
@@ -51,6 +58,7 @@ export class AuthController {
                 data: {
                     id: user.id,
                     email: user.email,
+                    username: user.username,
                     displayName: user.displayName,
                     avatarUrl: user.avatarUrl,
                     emailVerified: user.emailVerified,
@@ -156,6 +164,7 @@ export class AuthController {
                 data: {
                     id: user.id,
                     email: user.email,
+                    username: user.username,
                     displayName: user.displayName,
                     avatarUrl: user.avatarUrl,
                     emailVerified: user.emailVerified,
