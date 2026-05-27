@@ -9,6 +9,8 @@ const router = Router();
 router.use(authMiddleware);
 
 
+router.get("/", RepoController.list);
+router.get("/check-name/:repoName", RepoController.checkRepoNameAvailability);
 router.post("/create", RepoController.create);
 router.get("/:repoId", repoContext, authorize("repo:view"), RepoController.getById);
 router.put("/:repoId", repoContext, authorize("repo:settings"), RepoController.update);

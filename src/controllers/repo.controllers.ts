@@ -2,7 +2,7 @@ import { NextFunction, Request, Response } from "express";
 import { handleError } from "../middlewares/error.middleware";
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors/app.error";
 import db from "../services/database.service";
-import { createRepoSchema, updateRepoSchema, userRepoRoleChangeSchema } from "../validators/repo.validator";
+import { createRepoSchema, listRepoSchema, repoNameSchema, updateRepoSchema, userRepoRoleChangeSchema } from "../validators/repo.validator";
 import mailService from "../services/mail.service";
 import { repoInviteTemplate } from "../templates/repo-invite.template";
 import { feUrls } from "../config/fe-urls";
@@ -10,6 +10,143 @@ import { Prisma } from "../generated/prisma/client";
 import logger from "../services/logger.service";
 
 export class RepoController {
+    static async checkRepoNameAvailability(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Not authenticated");
+
+            const parsedName = repoNameSchema.safeParse(req.params.repoName);
+            if (!parsedName.success) throw new BadRequestError(parsedName.error.issues[0].message);
+
+            const nameNormalized = parsedName.data.toLowerCase();
+
+            const existing = await db.prisma.repository.findFirst({
+                where: { ownerId: req.user.sub, nameNormalized, isDeleted: false },
+                select: { id: true },
+            });
+
+            res.status(200).json({
+                status: "success",
+                data: {
+                    name: parsedName.data,
+                    available: existing == null,
+                },
+            });
+        } catch (err) {
+            handleError("api/repo/check-name", err, next);
+        }
+    }
+
+    static async list(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Not authenticated");
+
+            const parsed = listRepoSchema.safeParse(req.query);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { q, owner, role, created_from, created_to, has_commits, sort, direction, page, per_page } = parsed.data;
+
+            const repoWhere: Prisma.RepositoryWhereInput = { isDeleted: false };
+
+            if (q) {
+                // q = User typed text search, can be anything.
+                const qNorm = q.toLowerCase();
+                repoWhere.OR = [
+                    { nameNormalized: { contains: qNorm } },
+                    { description: { contains: q, mode: "insensitive" } },
+                    { owner: { usernameNormalized: { contains: qNorm } } },
+                ];
+            }
+
+            if (owner) {
+                const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(owner);
+                if (isUuid) {
+                    repoWhere.ownerId = owner;
+                } else {
+                    repoWhere.owner = { usernameNormalized: owner.toLowerCase() };
+                }
+            }
+
+            if (created_from || created_to) {
+                repoWhere.createdAt = {
+                    ...(created_from ? { gte: created_from } : {}),
+                    ...(created_to ? { lte: created_to } : {}),
+                };
+            }
+
+            if (has_commits) {
+                repoWhere.headCommit = has_commits === "true" ? { not: null } : null;
+            }
+
+            const memberWhere: Prisma.RepoMemberWhereInput = {
+                userId: req.user.sub,
+                deletedAt: null,
+                repo: repoWhere,
+            };
+            if (role) memberWhere.role = role;
+
+            const sortFieldMap = { created: "createdAt", updated: "updatedAt", name: "nameNormalized" } as const;
+            const orderBy: Prisma.RepoMemberOrderByWithRelationInput = {
+                repo: { [sortFieldMap[sort]]: direction },
+            };
+
+            const skip = (page - 1) * per_page;
+
+            const [total_count, memberships] = await db.prisma.$transaction([
+                db.prisma.repoMember.count({ where: memberWhere }),
+                db.prisma.repoMember.findMany({
+                    where: memberWhere,
+                    orderBy,
+                    skip,
+                    take: per_page,
+                    select: {
+                        role: true,
+                        repo: {
+                            select: {
+                                id: true,
+                                name: true,
+                                description: true,
+                                ownerId: true,
+                                headCommit: true,
+                                createdAt: true,
+                                updatedAt: true,
+                                owner: { select: { username: true, usernameNormalized: true, avatarUrl: true } },
+                            },
+                        },
+                    },
+                }),
+            ]);
+
+            const items = memberships.map((m) => ({
+                id: m.repo.id,
+                name: m.repo.name,
+                description: m.repo.description,
+                ownerId: m.repo.ownerId,
+                owner: {
+                    username: m.repo.owner.username,
+                    usernameNormalized: m.repo.owner.usernameNormalized,
+                    avatarUrl: m.repo.owner.avatarUrl,
+                },
+                headCommit: m.repo.headCommit,
+                createdAt: m.repo.createdAt,
+                updatedAt: m.repo.updatedAt,
+                role: m.role,
+            }));
+
+            res.status(200).json({
+                status: "success",
+                data: {
+                    items,
+                    page,
+                    per_page,
+                    total_count,
+                    total_pages: total_count === 0 ? 0 : Math.ceil(total_count / per_page),
+                },
+            });
+        } catch (err) {
+            handleError("api/repo/list", err, next);
+        }
+    }
+
     static async create(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Not authenticated");
@@ -17,7 +154,7 @@ export class RepoController {
             const parsed = createRepoSchema.safeParse(req.body);
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
 
-            const { name, description } = parsed.data;
+            const { name, description, users } = parsed.data;
             const nameNormalized = name.toLowerCase();
             const ownerId = req.user.sub;
 
@@ -29,6 +166,15 @@ export class RepoController {
                     });
                     await tx.repoMember.create({
                         data: { repoId: created.id, userId: ownerId, role: "owner" },
+                    });
+                    // join users with specified roles.
+                    if (users) await tx.repoMember.createMany({
+                        data: users?.map((user) => ({
+                            role: user.role,
+                            repoId: created.id,
+                            userId: user.userId
+                        })),
+                        skipDuplicates : true
                     });
                     return created;
                 });

@@ -17,6 +17,13 @@ export const usernameSchema = z
     .refine((val) => !val.includes("--"), { message: "Username cannot contain consecutive hyphens." })
     .refine((val) => !RESERVED_USERNAMES.has(val.toLowerCase()), { message: "This username is reserved." });
 
+
+export const repositoryNonMemberUsersSchema = z.object({
+    username: usernameSchema,
+    repoId : z.string().uuid().optional()
+});
+
+
 export const registerSchema = z.object({
     email: z
         .string({ message: "Email is required." })
