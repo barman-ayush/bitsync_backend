@@ -148,7 +148,7 @@ async function main() {
   // Order matters only if you don't use CASCADE.
   await db.prisma.$executeRawUnsafe(`
     TRUNCATE TABLE
-      "invitations",
+      "notifications",
       "repo_members",
       "repositories",
       "refresh_tokens",

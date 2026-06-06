@@ -2,14 +2,26 @@ import { NextFunction, Request, Response } from "express";
 import { handleError } from "../middlewares/error.middleware";
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors/app.error";
 import db from "../services/database.service";
-import { createRepoSchema, listRepoSchema, repoNameSchema, updateRepoSchema, userRepoRoleChangeSchema } from "../validators/repo.validator";
-import mailService from "../services/mail.service";
-import { repoInviteTemplate } from "../templates/repo-invite.template";
-import { feUrls } from "../config/fe-urls";
+import { createRepoSchema, invitationBodySchema, inviteUsers, listRepoSchema, memberTargetSchema, repoNameSchema, updateRepoSchema, userRepoRoleChangeSchema } from "../validators/repo.validator";
 import { Prisma } from "../generated/prisma/client";
+import notificationService from "../services/notification.service";
+import { InviteByEmailResult, RepoInviteData } from "../types/notification.types";
 import logger from "../services/logger.service";
 
 export class RepoController {
+    // inviteSummary - Shapes an invite batch result for API responses (counts
+    // for the buckets, raw emails for what the caller needs to act on).
+    private static inviteSummary(result: InviteByEmailResult) {
+        return {
+            invited: result.created.length,
+            updated: result.updated.length,
+            skipped: result.skipped.length,
+            notFound: result.notFound,
+            alreadyMember: result.alreadyMember,
+        };
+    }
+
+    // checkRepoNameAvailability : Checks whether a given username under a given username is available or not.
     static async checkRepoNameAvailability(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Not authenticated");
@@ -36,7 +48,8 @@ export class RepoController {
         }
     }
 
-    static async list(req: Request, res: Response, next: NextFunction): Promise<void> {
+    // searchRepository : Queries Repository using keywords/filters.
+    static async searchRepository(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Not authenticated");
 
@@ -143,7 +156,7 @@ export class RepoController {
                 },
             });
         } catch (err) {
-            handleError("api/repo/list", err, next);
+            handleError("api/repo/", err, next);
         }
     }
 
@@ -167,15 +180,6 @@ export class RepoController {
                     await tx.repoMember.create({
                         data: { repoId: created.id, userId: ownerId, role: "owner" },
                     });
-                    // join users with specified roles.
-                    if (users) await tx.repoMember.createMany({
-                        data: users?.map((user) => ({
-                            role: user.role,
-                            repoId: created.id,
-                            userId: user.userId
-                        })),
-                        skipDuplicates : true
-                    });
                     return created;
                 });
             } catch (err) {
@@ -183,6 +187,26 @@ export class RepoController {
                     throw new ConflictError("You already have a repository with this name.");
                 }
                 throw err;
+            }
+
+            // Invitees go through the same repo_invite notification flow as the
+            // invite endpoint — they only become members once they accept. The
+            // repo is already committed, so an invite failure must not 500 the
+            // creation; it is reported as invites: null instead.
+            let invites = null;
+            if (users && users.length > 0) {
+                try {
+                    const result = await notificationService.inviteByEmail({
+                        actorId: ownerId,
+                        actorName: req.user.name,
+                        repoId: repo.id,
+                        repoName: repo.name,
+                        users,
+                    });
+                    invites = RepoController.inviteSummary(result);
+                } catch (err) {
+                    logger.error("api/repo/create", `Failed to send invites for repo ${repo.id}: ${err}`);
+                }
             }
 
             res.status(201).json({
@@ -197,356 +221,408 @@ export class RepoController {
                     createdAt: repo.createdAt,
                     updatedAt: repo.updatedAt,
                     role: "owner",
+                    invites,
                 },
             });
         } catch (err) {
             handleError("api/repo/create", err, next);
         }
     }
-
-    static async update(req: Request, res: Response, next: NextFunction): Promise<void> {
+    // showRepo - Page-mount response. Returns the full repo metadata resolved by
+    // resolveRepoBySlug, including the repo id and the caller's role. The FE holds
+    // the id and uses it for all subsequent tab/data calls (/:repoId/...).
+    static async showRepo(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
-            const { repoId } = req.params;
+            const repo = req.repo;
+            if (!repo) throw new NotFoundError("Repository not found");
 
-            const parsed = updateRepoSchema.safeParse(req.body);
+            res.status(200).json({
+                status: "success",
+                data: {
+                    id: repo.id,
+                    name: repo.name,
+                    description: repo.description,
+                    ownerId: repo.ownerId,
+                    headCommit: repo.headCommit,
+                    createdAt: repo.createdAt,
+                    updatedAt: repo.updatedAt,
+                    role: req.membership?.role,
+                },
+            });
+        } catch (e) {
+            handleError("api/repo/:username/:reponame", e, next);
+        }
+    }
+
+    // fetchContributors - Contributors tab. Keyed off req.repoId (set by
+    // requireRepoAccess); single RepoMember read, no join.
+    static async fetchContributors(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            const contributors = await db.prisma.repoMember.findMany({
+                where: { repoId: req.repoId, deletedAt: null },
+                select: {
+                    role: true,
+                    joinedAt: true,
+                    user: {
+                        select: {
+                            id: true,
+                            displayName: true,
+                            username: true,
+                            email: true,
+                            avatarUrl: true,
+                        }
+                    }
+                }
+            });
+
+            res.status(200).json({
+                status: "success",
+                data: contributors
+            });
+        } catch (e) {
+            handleError("api/repo/:repoId/contributors", e, next);
+        }
+    }
+    // inviteContributors - Invites a batch of existing users (by email) to the
+    // repo as member/admin. Access (owner/admin) is enforced by middleware via
+    // requireRepoAccess + authorize("member:invite"). Each invite becomes a
+    // repo_invite notification; the create/update/skip decision lives in the
+    // notification service. Emails with no account or users who are already
+    // active members are reported back without failing the request.
+    static async inviteContributors(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Not authenticated");
+
+            const repoId = req.repoId;
+            if (!repoId) throw new BadRequestError("Repository id is required.");
+
+
+            const parsed = inviteUsers.safeParse(req.body);
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
 
-            const { name, description } = parsed.data;
-            const nameNormalized = name.toLowerCase();
+            // Repo name is snapshotted into the notification; access was already
+            // verified by the middleware.
+            const repo = await db.prisma.repository.findFirst({
+                where: { id: repoId, isDeleted: false },
+                select: { name: true },
+            });
+            if (!repo) throw new NotFoundError("Repository not found");
 
-            let repo;
-            try {
-                repo = await db.prisma.repository.update({
-                    where: { id: repoId as string },
-                    data: { name, nameNormalized, description: description ?? null },
-                });
-            } catch (err) {
-                if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-                    throw new ConflictError("You already have a repository with this name.");
-                }
-                throw err;
+            const result = await notificationService.inviteByEmail({
+                actorId: req.user.sub,
+                actorName: req.user.name,
+                repoId,
+                repoName: repo.name,
+                users: parsed.data,
+            });
+
+            res.status(200).json({
+                status: "success",
+                message: "Invitations processed.",
+                data: RepoController.inviteSummary(result),
+            });
+        } catch (e) {
+            handleError("api/repo/:repoId/invite", e, next);
+        }
+    }
+
+    // acceptInvite - Accepts a repo_invite notification (the notification IS the
+    // invite — its data snapshot carries repoId/role). The invite is consumed
+    // (hard-deleted) on every outcome; what varies is the message:
+    //   - expired              -> delete, 400 "invitation expired"
+    //   - repo gone            -> delete, 404 "repository no longer exists"
+    //   - already a member     -> delete, 200 (no membership change)
+    //   - otherwise            -> create/revive membership + delete, atomically
+    static async acceptInvite(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const parsed = invitationBodySchema.safeParse(req.body);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { notificationId } = parsed.data;
+            const userId = req.user.sub;
+
+            // Must be this user's own repo_invite — scoping by userId also
+            // prevents accepting someone else's invite by guessing ids.
+            const invite = await db.prisma.notification.findFirst({
+                where: { id: notificationId, userId, type: "repo_invite" },
+            });
+            if (!invite) throw new NotFoundError("Invitation not found.");
+
+            const { repoId, repoName, role } = invite.data as RepoInviteData;
+
+            // Expired — consume the invite and tell the user to ask for a new one.
+            if (invite.expiresAt && invite.expiresAt.getTime() <= Date.now()) {
+                await db.prisma.notification.delete({ where: { id: invite.id } });
+                throw new BadRequestError("This invitation has expired. Ask for a new invite.");
             }
 
-            res.status(200).json({
-                status: "success",
-                message: "Repository updated.",
-                data: {
-                    id: repo.id,
-                    name: repo.name,
-                    description: repo.description,
-                    ownerId: repo.ownerId,
-                    headCommit: repo.headCommit,
-                    createdAt: repo.createdAt,
-                    updatedAt: repo.updatedAt,
-                    role: req.membership?.role,
-                },
-            });
-        } catch (err) {
-            handleError("[PUT]:api/repo/:id", err, next);
-        }
-    }
-
-    static async getById(req: Request, res: Response, next: NextFunction): Promise<void> {
-        try {
-            const repo = req.repo!;
-
-            res.status(200).json({
-                status: "success",
-                data: {
-                    id: repo.id,
-                    name: repo.name,
-                    description: repo.description,
-                    ownerId: repo.ownerId,
-                    headCommit: repo.headCommit,
-                    createdAt: repo.createdAt,
-                    updatedAt: repo.updatedAt,
-                    role: req.membership?.role,
-                },
-            });
-        } catch (err) {
-            handleError("[GET]:api/repo/:id", err, next);
-        }
-    }
-    static async inviteUser(req: Request, res: Response, next: NextFunction): Promise<void> {
-        try {
-            const repo = req.repo!;
-            const inviter = req.user!;
-
-            const parsedData = userRepoRoleChangeSchema.safeParse(req.body);
-            if (!parsedData.success) throw new BadRequestError(parsedData.error.issues[0].message);
-
-            const { invitee_user_id, invitee_user_role } = parsedData.data;
-
-            if (inviter.sub === invitee_user_id) throw new ForbiddenError("User cannot be self-invited");
-
-            const invitee = await db.prisma.user.findUnique({ where: { id: invitee_user_id } });
-            if (!invitee) throw new NotFoundError("User not found.");
-
-            const existingMember = await db.prisma.repoMember.findFirst({
-                where: { repoId: repo.id, userId: invitee_user_id, deletedAt: null },
+            // data is a snapshot (no FK) — the repo may have been deleted since.
+            const repo = await db.prisma.repository.findFirst({
+                where: { id: repoId, isDeleted: false },
                 select: { id: true },
             });
-            if (existingMember) throw new ConflictError("User is already a member of this repository.");
-
-            const existing = await db.prisma.invitations.findFirst({
-                where: { repoId: repo.id, inviteeId: invitee_user_id },
-                orderBy: { createdAt: "desc" },
-            });
-
-            if (existing) {
-                const isExpired = existing.expiresAt.getTime() < Date.now();
-                if (!isExpired) {
-                    throw new ConflictError("A pending invitation already exists for this user.");
-                }
+            if (!repo) {
+                await db.prisma.notification.delete({ where: { id: invite.id } });
+                throw new NotFoundError(`${repoName} no longer exists.`);
             }
 
-            let invitation;
-            try {
-                invitation = await db.prisma.$transaction(async (tx) => {
-                    const actor = await tx.repoMember.findFirst({
-                        where: { repoId: repo.id, userId: inviter.sub, deletedAt: null },
-                    });
-                    if (!actor || (actor.role !== "owner" && actor.role !== "admin")) {
-                        throw new ForbiddenError("Insufficient permissions");
-                    }
-                    if (actor.role === "admin" && invitee_user_role !== "member") {
-                        throw new ForbiddenError("Admins can only invite members.");
-                    }
-
-                    if (existing) {
-                        await tx.invitations.deleteMany({ where: { id: existing.id } });
-                    }
-                    return tx.invitations.create({
-                        data: {
-                            repoId: repo.id,
-                            inviterId: inviter.sub,
-                            inviteeId: invitee_user_id,
-                            inviteeEmail: invitee.email,
-                            role: invitee_user_role,
-                        },
-                    });
-                });
-            } catch (err) {
-                if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-                    throw new ConflictError("A pending invitation already exists for this user.");
-                }
-                throw err;
-            }
-
-            const inviteLink = `${feUrls.home}/notifications`;
-            try {
-                await mailService.sendMail(
-                    invitee.email,
-                    `Invitation to join ${repo.name}`,
-                    repoInviteTemplate(inviter.name, repo.name, invitee_user_role, inviteLink),
-                );
-            } catch (mailErr) {
-                logger.warn(
-                    "api/repo/user/invite",
-                    `Failed to send invite email to ${invitee.email}: ${mailErr instanceof Error ? mailErr.message : String(mailErr)}`,
-                );
-            }
-
-            res.status(201).json({
-                status: "success",
-                message: "Invitation sent.",
-                data: {
-                    id: invitation.id,
-                    repoId: invitation.repoId,
-                    inviteeId: invitation.inviteeId,
-                    inviteeEmail: invitation.inviteeEmail,
-                    role: invitation.role,
-                    expiresAt: invitation.expiresAt,
-                    createdAt: invitation.createdAt,
-                },
-            });
-        } catch (err) {
-            handleError("api/repo/user/invite/:id", err, next);
-        }
-    }
-
-    static async removeUser(req: Request, res: Response, next: NextFunction): Promise<void> {
-        try {
-            const repo = req.repo!;
-            const inviterId = req.user!.sub;
-
-            const parsedData = userRepoRoleChangeSchema.safeParse(req.body);
-            if (!parsedData.success) throw new BadRequestError(parsedData.error.issues[0].message);
-
-            const { invitee_user_id } = parsedData.data;
-
-            if (invitee_user_id === inviterId) {
-                throw new BadRequestError("Use leave repository instead.");
-            }
-
-            await db.prisma.$transaction(async (tx) => {
-                const actor = await tx.repoMember.findFirst({
-                    where: { repoId: repo.id, userId: inviterId, deletedAt: null },
-                });
-                if (!actor || (actor.role !== "owner" && actor.role !== "admin")) {
-                    throw new ForbiddenError("Insufficient permissions");
-                }
-
-                const target = await tx.repoMember.findFirst({
-                    where: { repoId: repo.id, userId: invitee_user_id, deletedAt: null },
-                });
-                if (!target) throw new NotFoundError("Member not found.");
-
-                if (target.role === "owner") {
-                    throw new ForbiddenError("Owner cannot be removed.");
-                }
-
-                if (actor.role === "admin" && target.role === "admin") {
-                    throw new ForbiddenError("Admins can only remove members.");
-                }
-
-                await tx.repoMember.update({
-                    where: { id: target.id },
-                    data: { deletedAt: new Date() },
-                });
-
-                await tx.invitations.deleteMany({
-                    where: {
-                        repoId: repo.id,
-                        OR: [{ inviteeId: invitee_user_id }, { inviterId: invitee_user_id }],
-                    },
-                });
+            // Existing membership row, active or soft-deleted (unique on repoId+userId).
+            const membership = await db.prisma.repoMember.findUnique({
+                where: { repoId_userId: { repoId, userId } },
             });
 
-            res.status(200).json({
-                status: "success",
-                message: "Member removed.",
-            });
-        } catch (err) {
-            handleError("/api/repo/user/remove/:id", err, next);
-        }
-    }
-
-    static async promoteUser(req: Request, res: Response, next: NextFunction): Promise<void> {
-        try {
-            const repo = req.repo!;
-            const inviterId = req.user!.sub;
-
-            const parsedData = userRepoRoleChangeSchema.safeParse(req.body);
-            if (!parsedData.success) throw new BadRequestError(parsedData.error.issues[0].message);
-
-            const { invitee_user_id } = parsedData.data;
-
-            if (invitee_user_id === inviterId) {
-                throw new BadRequestError("Cannot change your own role.");
-            }
-
-            const { updated, alreadyAdmin } = await db.prisma.$transaction(async (tx) => {
-                const actor = await tx.repoMember.findFirst({
-                    where: { repoId: repo.id, userId: inviterId, deletedAt: null },
-                });
-                if (!actor || (actor.role !== "owner" && actor.role !== "admin")) {
-                    throw new ForbiddenError("Insufficient permissions");
-                }
-
-                const target = await tx.repoMember.findFirst({
-                    where: { repoId: repo.id, userId: invitee_user_id, deletedAt: null },
-                });
-                if (!target) throw new NotFoundError("Member not found.");
-
-                if (target.role === "owner") {
-                    throw new BadRequestError("Cannot promote owners.");
-                }
-                if (target.role === "admin") {
-                    return { updated: target, alreadyAdmin: true };
-                }
-
-                const result = await tx.repoMember.update({
-                    where: { id: target.id },
-                    data: { role: "admin" },
-                });
-                return { updated: result, alreadyAdmin: false };
-            });
-
-            if (alreadyAdmin) {
+            // Already in the repo (any role) — consume the invite, change nothing.
+            if (membership && membership.deletedAt === null) {
+                await db.prisma.notification.delete({ where: { id: invite.id } });
                 res.status(200).json({
                     status: "success",
-                    message: "User already an admin.",
+                    message: `You are already a member of ${repoName}.`,
                 });
                 return;
             }
 
+            // Join (or rejoin if previously removed) and consume the invite atomically.
+            await db.prisma.$transaction([
+                membership
+                    ? db.prisma.repoMember.update({
+                        where: { id: membership.id },
+                        data: { role, deletedAt: null, joinedAt: new Date() },
+                    })
+                    : db.prisma.repoMember.create({ data: { repoId, userId, role } }),
+                db.prisma.notification.delete({ where: { id: invite.id } }),
+            ]);
+
+            // Tell the inviter (spec 03 §2). actorId can be null if the
+            // inviter's account was deleted — nobody to notify then.
+            if (invite.actorId) {
+                await notificationService.notify({
+                    userId: invite.actorId,
+                    actorId: userId,
+                    type: "invite_accepted",
+                    context: { actorName: req.user.name, repoName },
+                    data: { repoId, repoName },
+                });
+            }
+
             res.status(200).json({
                 status: "success",
-                message: "Member promoted to admin.",
-                data: { invitee_user_id: updated.userId, role: updated.role },
+                message: `You joined ${repoName} as ${role}.`,
             });
+
         } catch (err) {
-            handleError("/api/repo/user/promote/:id", err, next);
+            handleError("/api/repo/invite/accept", err, next);
         }
     }
 
-    static async demoteUser(req: Request, res: Response, next: NextFunction): Promise<void> {
+    // declineInvite - Declines a repo_invite notification. Declining consumes
+    // the invite the same way accepting does, but nothing else changes — so the
+    // expiry/repo-exists checks from acceptInvite are pointless here: whatever
+    // their answer, the outcome is identical (delete the invite). Find it,
+    // delete it, done.
+    static async declineInvite(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
-            const repo = req.repo!;
-            const inviterId = req.user!.sub;
+            if (!req.user) throw new UnauthorizedError("Please Login");
 
-            const parsedData = userRepoRoleChangeSchema.safeParse(req.body);
-            if (!parsedData.success) throw new BadRequestError(parsedData.error.issues[0].message);
+            const parsed = invitationBodySchema.safeParse(req.body);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
 
-            const { invitee_user_id } = parsedData.data;
+            const { notificationId } = parsed.data;
+            const userId = req.user.sub;
 
-            if (invitee_user_id === inviterId) {
-                throw new BadRequestError("Cannot change your own role.");
+            // Must be this user's own repo_invite — scoping by userId also
+            // prevents declining someone else's invite by guessing ids.
+            const invite = await db.prisma.notification.findFirst({
+                where: { id: notificationId, userId, type: "repo_invite" },
+            });
+            if (!invite) throw new NotFoundError("Invitation not found.");
+
+            const { repoId, repoName } = invite.data as RepoInviteData;
+
+            await db.prisma.notification.delete({ where: { id: invite.id } });
+
+            // Tell the inviter (spec 03 §2). actorId can be null if the
+            // inviter's account was deleted — nobody to notify then.
+            if (invite.actorId) {
+                await notificationService.notify({
+                    userId: invite.actorId,
+                    actorId: userId,
+                    type: "invite_declined",
+                    context: { actorName: req.user.name, repoName },
+                    data: { repoId, repoName },
+                });
             }
 
-            const updated = await db.prisma.$transaction(async (tx) => {
-                const actor = await tx.repoMember.findFirst({
-                    where: { repoId: repo.id, userId: inviterId, deletedAt: null },
-                });
-                if (!actor || actor.role !== "owner") {
-                    throw new ForbiddenError("Only owners can demote admins.");
-                }
+            res.status(200).json({
+                status: "success",
+                message: `Invitation to ${repoName} declined.`,
+            });
 
-                const target = await tx.repoMember.findFirst({
-                    where: { repoId: repo.id, userId: invitee_user_id, deletedAt: null },
-                });
-                if (!target) throw new NotFoundError("Member not found.");
+        } catch (err) {
+            handleError("/api/repo/invite/decline", err, next);
+        }
+    }
 
-                if (target.role === "owner") {
-                    throw new ForbiddenError("Owners cannot be demoted.");
-                }
+    // resolveMemberTarget - Shared lookup for remove/promote/demote: validates
+    // the body, loads the target's ACTIVE membership (soft-deleted rows are
+    // "not a member") and the repo name for the outgoing notification.
+    private static async resolveMemberTarget(req: Request) {
+        const repoId = req.repoId;
+        if (!repoId) throw new BadRequestError("Repository id is required.");
 
-                if (target.role === "member") {
-                    throw new BadRequestError("Members cannot be demoted any further.");
-                }
+        const parsed = memberTargetSchema.safeParse(req.body);
+        if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+        const { userId } = parsed.data;
 
-                const result = await tx.repoMember.update({
-                    where: { id: target.id },
-                    data: { role: "member" },
-                });
+        const [membership, repo] = await Promise.all([
+            db.prisma.repoMember.findUnique({
+                where: { repoId_userId: { repoId, userId }, deletedAt: null },
+            }),
+            db.prisma.repository.findUnique({ where: { id: repoId }, select: { name: true } }),
+        ]);
 
-                await tx.invitations.updateMany({
-                    where: {
-                        repoId: repo.id,
-                        inviteeId: invitee_user_id,
-                        role: "admin",
-                    },
-                    data: { role: "member" },
-                });
+        if (!repo) throw new NotFoundError("Repository not found");
+        if (!membership) throw new NotFoundError("User is not a member of this repository.");
 
-                await tx.invitations.deleteMany({
-                    where: {
-                        repoId: repo.id,
-                        inviterId: invitee_user_id,
-                    },
-                });
+        return { repoId, userId, membership, repoName: repo.name };
+    }
 
-                return result;
+    // leaveRepository - Caller removes themselves from the repo. Active
+    // membership is already verified by requireRepoAccess; the owner cannot
+    // leave (the repo would be orphaned) — transfer or delete instead.
+    static async leaveRepository(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const repoId = req.repoId;
+            if (!repoId) throw new BadRequestError("Repository id is required.");
+
+            if (req.membership?.role === "owner") {
+                throw new ForbiddenError("Owner cannot leave the repository. Transfer ownership or delete it instead.");
+            }
+
+            await db.prisma.repoMember.update({
+                where: { repoId_userId: { repoId, userId: req.user.sub } },
+                data: { deletedAt: new Date() },
             });
 
             res.status(200).json({
                 status: "success",
-                message: "Admin demoted to member.",
-                data: { invitee_user_id: updated.userId, role: updated.role },
+                message: "You left the repository.",
             });
         } catch (err) {
-            handleError("/api/repo/user/demote/:id", err, next);
+            handleError("/api/repo/:repoId/leave", err, next);
+        }
+    }
+
+    // removeUser - Soft-deletes the target's membership. Caller's owner/admin
+    // role is enforced by authorize("member:remove"); on top of that:
+    //   - the owner can never be removed
+    //   - an admin can only remove members — removing an admin takes the owner
+    //   - self-removal is rejected (that's what /leave is for)
+    static async removeUser(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const { repoId, userId, membership, repoName } = await RepoController.resolveMemberTarget(req);
+
+            if (req.user.sub === userId) {
+                throw new BadRequestError("You cannot remove yourself — leave the repository instead.");
+            }
+            if (membership.role === "owner") {
+                throw new ForbiddenError("The owner cannot be removed.");
+            }
+            if (membership.role === "admin" && req.membership?.role !== "owner") {
+                throw new ForbiddenError("Only the owner can remove an admin.");
+            }
+
+            await db.prisma.repoMember.update({
+                where: { id: membership.id },
+                data: { deletedAt: new Date() },
+            });
+
+            await notificationService.notify({
+                userId,
+                actorId: req.user.sub,
+                type: "member_removed",
+                context: { actorName: req.user.name, repoName },
+                data: { repoId, repoName },
+            });
+
+            res.status(200).json({
+                status: "success",
+                message: "User removed from the repository.",
+            });
+        } catch (err) {
+            handleError("/api/repo/:repoId/remove", err, next);
+        }
+    }
+
+    // promoteUser - member -> admin. Caller's owner/admin role is enforced by
+    // authorize("member:promote"); the owner's role is immutable and an admin
+    // target is reported as a conflict, not silently ignored.
+    static async promoteUser(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const { repoId, userId, membership, repoName } = await RepoController.resolveMemberTarget(req);
+
+            if (membership.role === "owner") throw new BadRequestError("The owner's role cannot be changed.");
+            if (membership.role === "admin") throw new ConflictError("User is already an admin.");
+
+            await db.prisma.repoMember.update({
+                where: { id: membership.id },
+                data: { role: "admin" },
+            });
+
+            await notificationService.notify({
+                userId,
+                actorId: req.user.sub,
+                type: "role_changed",
+                context: { actorName: req.user.name, repoName, oldRole: "member", newRole: "admin" },
+                data: { repoId, repoName, oldRole: "member", newRole: "admin" },
+            });
+
+            res.status(200).json({
+                status: "success",
+                message: "User promoted to admin.",
+            });
+        } catch (err) {
+            handleError("/api/repo/:repoId/promote", err, next);
+        }
+    }
+
+    // demoteUser - admin -> member. Owner-only via authorize("member:demote");
+    // the owner's role is immutable and a member target is a conflict.
+    static async demoteUser(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const { repoId, userId, membership, repoName } = await RepoController.resolveMemberTarget(req);
+
+            if (membership.role === "owner") throw new BadRequestError("The owner's role cannot be changed.");
+            if (membership.role === "member") throw new ConflictError("User is already a member.");
+
+            await db.prisma.repoMember.update({
+                where: { id: membership.id },
+                data: { role: "member" },
+            });
+
+            await notificationService.notify({
+                userId,
+                actorId: req.user.sub,
+                type: "role_changed",
+                context: { actorName: req.user.name, repoName, oldRole: "admin", newRole: "member" },
+                data: { repoId, repoName, oldRole: "admin", newRole: "member" },
+            });
+
+            res.status(200).json({
+                status: "success",
+                message: "User demoted to member.",
+            });
+        } catch (err) {
+            handleError("/api/repo/:repoId/demote", err, next);
         }
     }
 }

@@ -8,6 +8,7 @@ export const PERMISSIONS: Record<string, RepoRole[]> = {
     "repo:view": ["owner", "admin", "member"],
     "repo:settings": ["owner", "admin"],
     "repo:delete": ["owner"],
+    "member:invite": ["owner", "admin"],
     "member:remove": ["owner", "admin"],
     "member:promote": ["owner", "admin"],
     "member:demote": ["owner"],

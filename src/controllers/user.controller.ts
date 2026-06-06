@@ -37,7 +37,7 @@ export class UserDataController {
         try {
             if (!req.user) throw new UnauthorizedError("Not authenticated");
 
-            const parsedData = repositoryNonMemberUsersSchema.safeParse(req.params.username);
+            const parsedData = repositoryNonMemberUsersSchema.safeParse(req.params);
             if (!parsedData.success) throw new BadRequestError(parsedData.error.issues[0].message);
 
             const { username, repoId } = parsedData.data;
@@ -45,9 +45,11 @@ export class UserDataController {
             const nameNormalized = username.toLowerCase();
 
 
+            // Caller must be an ACTIVE member — a removed (soft-deleted)
+            // membership doesn't grant search access.
             const isAllowed = await db.prisma.repoMember.findFirst({
                 where: {
-                    repoId: repoId, userId: req.user.sub
+                    repoId: repoId, userId: req.user.sub, deletedAt: null
                 }
             })
             if (!isAllowed) throw new UnauthorizedError("You are not authorised to search for this repository.");
@@ -62,9 +64,13 @@ export class UserDataController {
                         not: req.user.sub,
                     },
 
+                    // Exclude only ACTIVE members. Users with a soft-deleted
+                    // membership (removed/left) must stay searchable — they can
+                    // be re-invited, and accepting revives their row.
                     repoMemberships: {
                         none: {
                             repoId: repoId,
+                            deletedAt: null,
                         },
                     },
                 },

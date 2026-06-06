@@ -7,5 +7,6 @@ declare module "express-serve-static-core" {
         user?: AccessTokenPayload;
         membership?: { role: RepoRole };
         repo?: RepoContextRepo;
+        repoId?: string;
     }
 }
