@@ -6,6 +6,7 @@ export type RepoRole = "owner" | "admin" | "member";
 
 export const PERMISSIONS: Record<string, RepoRole[]> = {
     "repo:view": ["owner", "admin", "member"],
+    "repo:push": ["owner", "admin", "member"],
     "repo:settings": ["owner", "admin"],
     "repo:delete": ["owner"],
     "member:invite": ["owner", "admin"],

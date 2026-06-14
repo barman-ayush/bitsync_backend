@@ -7,7 +7,7 @@
     "dev": "nodemon --watch src --ext ts --exec ts-node src/app.ts",
     "build": "tsc",
     "start": "node dist/app.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --require ts-node/register --test \"src/**/*.test.ts\""
   },
   "repository": {
     "type": "git",
@@ -39,6 +39,7 @@
     "@prisma/adapter-pg": "^7.6.0",
     "@prisma/client": "^7.6.0",
     "bcrypt": "^6.0.0",
+    "cloudinary": "^2.10.0",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "dotenv": "^17.4.1",
