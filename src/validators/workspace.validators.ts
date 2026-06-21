@@ -23,6 +23,24 @@ export const workspaceTreeParamsSchema = z.object({
     workspaceId: z.string().uuid(),
 });
 
+// Body for creating a commit from a workspace's uncommitted changes. The author
+// comes from the authenticated user and the changes from workspace_changes — the
+// client supplies only the commit message.
+export const createCommitSchema = z.object({
+    message: z.string().trim().min(1, "Commit message is required.").max(1000),
+});
+
+// Query for a workspace's commit history (infinite scroll). `cursor` is the
+// commitHash of the last commit from the previous page; omitted on the first
+// request. Commit hashes are 64-char lowercase hex sha256 (02_hashing).
+export const listCommitHistoryQuerySchema = z.object({
+    cursor: z
+        .string()
+        .regex(/^[a-f0-9]{64}$/, "cursor must be a commit hash (64-char lowercase hex sha256).")
+        .optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
 // Params for fetching a blob's signed download URL. blobHash is the
 // content-addressed id (64-char lowercase hex sha256).
 export const blobDownloadParamsSchema = z.object({

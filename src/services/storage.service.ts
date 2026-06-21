@@ -1,6 +1,18 @@
-import { ResolvedTree, TreeEntryType, WorkspaceTree, WorkspaceTreeEntry } from "../types/storage.types";
+import { BadRequestError, ConflictError, InternalError, NotFoundError } from "../errors/app.error";
+import { Prisma } from "../generated/prisma/client";
+import { hashCommit, hashTrees } from "../utils/blob.utils";
+import { BuildTreeChange, CommitIdentity, CreateCommitInput, CreateCommitResult, ParentCommitRef, PathMap, ResolvedTree, TreeChild, TreeEntryType, WorkspaceTree, WorkspaceTreeEntry } from "../types/storage.types";
 import db from "./database.service";
 
+const MAX_DEPTH = 256;
+
+// All BitSync timestamps are stored in IST (01_storage §7); the commit hash
+// embeds the matching UTC offset so a recomputed hash verifies byte-for-byte.
+const COMMIT_TIMEZONE = "+0530";
+
+// Number of path segments in a directory prefix, used to order dirty dirs
+// deepest-first for the bottom-up rebuild. "" -> 0, "src/" -> 1, "src/lib/" -> 2.
+const dirDepth = (dirPath: string): number => (dirPath.match(/\//g) ?? []).length;
 class StorageService {
     private static instance: StorageService;
 
@@ -135,7 +147,7 @@ class StorageService {
                 }
                 continue;
             }
-            
+
             // Files
             const change = immediate.get(entry.name);
             if (!change || change.kind !== "file") {
@@ -143,7 +155,7 @@ class StorageService {
                 result.push({ ...entry, status: "COMMITTED" });
                 continue;
             }
-            
+
             // This file was modified/deleted in the uncommitted changes
             immediate.delete(entry.name);
 
@@ -232,6 +244,306 @@ class StorageService {
         }
 
         return null;
+    }
+
+    // flatten_tree : recursively walk a tree and produce a flat path -> hash map
+    // (spec 03_commit §2.5). This is the bottleneck of commit creation: every
+    // file in the parent commit is visited once, O(n) in repo size.
+    //
+    // Blobs are keyed by full path ("src/main.py"); directories are *also*
+    // recorded under their trailing-slash path ("src/") alongside their children,
+    // so the rebuild step can reuse an unchanged subtree by its hash. A null
+    // tree_hash (empty repo with no commits) flattens to an empty map, never null,
+    // so the recursive merge and downstream callers never need a null check.
+    // #TODO (Later) : Add WorkspaceIndex Table and flatten the tree from there
+    public async flatten_tree(
+        tree_hash: string | null,
+        prefix: string = "",
+        depth: number = 0,
+    ): Promise<PathMap> {
+        if (!tree_hash) return {};
+
+        if (depth > MAX_DEPTH)
+            throw new InternalError(`Maximum directory nesting depth (${MAX_DEPTH}) exceeded at: ${prefix}`);
+
+        const path_map: PathMap = {};
+        const entries = await db.prisma.treeEntry.findMany({
+            where: { parentTree: tree_hash },
+            select: { name: true, entryType: true, objectHash: true },
+        });
+
+        for (const entry of entries) {
+            const fullPath = prefix + entry.name;
+
+            if (entry.entryType === "blob") {
+                path_map[fullPath] = { type: "blob", hash: entry.objectHash };
+            } else {
+                // Recurse into the subdirectory, then record the directory itself.
+                const subPaths = await this.flatten_tree(entry.objectHash, fullPath + "/", depth + 1);
+                Object.assign(path_map, subPaths);
+                path_map[fullPath + "/"] = { type: "tree", hash: entry.objectHash };
+            }
+        }
+
+        return path_map;
+    }
+
+    // build_tree_from_changes : given the parent commit and a set of uncommitted
+    // changes, produce the new root tree hash, persisting every tree object that
+    // lies on a dirty path (spec 03_commit §2.3). Clean subtrees are reused by
+    // hash reference, so only O(changes * depth) tree objects are written.
+    //
+    // Pass `tx` to run inside the commit's transaction (atomic with the commit
+    // insert); it defaults to the shared client. Returns the root tree hash — the
+    // caller stores it as `commit.root_tree`.
+    public async build_tree_from_changes(
+        parentCommit: ParentCommitRef,
+        changes: BuildTreeChange[],
+        tx: Prisma.TransactionClient = db.prisma,
+    ): Promise<string> {
+        const parentRootTree = parentCommit.rootTree;
+
+        const pathMap = await this.flatten_tree(parentRootTree);
+
+        // Snapshot the parent's directory -> tree_hash map *before* mutating, for
+        // clean-subtree reuse. flatten_tree records every directory under its
+        // trailing-slash key, so we lift those out plus the root ("").
+        const parentDirMap: Record<string, string> = {};
+        if (parentRootTree) parentDirMap[""] = parentRootTree;
+        for (const [path, info] of Object.entries(pathMap)) {
+            if (info.type === "tree") parentDirMap[path] = info.hash;
+        }
+
+        // ADD must not clobber, MODIFY/DELETE must hit an existing file.
+        for (const change of changes) {
+            const existing = pathMap[change.filePath];
+            switch (change.action) {
+                case "ADD":
+                    if (existing) throw new ConflictError(`File already exists: ${change.filePath}`);
+                    if (!change.blobHash) throw new InternalError(`ADD without a blob hash: ${change.filePath}`);
+                    pathMap[change.filePath] = { type: "blob", hash: change.blobHash };
+                    break;
+                case "MODIFY":
+                    if (!existing) throw new ConflictError(`File does not exist: ${change.filePath}`);
+                    if (!change.blobHash) throw new InternalError(`MODIFY without a blob hash: ${change.filePath}`);
+                    pathMap[change.filePath] = { type: "blob", hash: change.blobHash };
+                    break;
+                case "DELETE":
+                    if (!existing) throw new ConflictError(`File does not exist: ${change.filePath}`);
+                    delete pathMap[change.filePath];
+                    break;
+            }
+        }
+
+        // Mark every ancestor directory of each changed file as dirty.
+        // The root ("") is always dirty when there is at least one change.
+        const dirtyDirs = new Set<string>([""]);
+        for (const change of changes) {
+            const segments = change.filePath.split("/");
+            for (let i = 0; i < segments.length - 1; i++) {
+                // dirtyDirs contain file path with trailing slashes
+                dirtyDirs.add(segments.slice(0, i + 1).join("/") + "/");
+            }
+        }
+
+        // Rebuild dirty trees bottom-up (deepest first) so a parent always
+        // sees its children's freshly computed hashes in `newTreeHashes`.
+        const sortedDirtyDirs = [...dirtyDirs].sort((a, b) => dirDepth(b) - dirDepth(a));
+        const newTreeHashes: Record<string, string> = {};
+
+        for (const dirPath of sortedDirtyDirs) {
+            const children = this.getImmediateChildren(pathMap, dirPath);
+            const entries: TreeChild[] = [];
+
+            for (const [childName, childInfo] of children) {
+                if (childInfo.type === "blob") {
+                    entries.push({ type: "blob", name: childName, objectHash: childInfo.hash });
+                    continue;
+                }
+
+                const childDirPath = dirPath + childName + "/";
+                if (dirtyDirs.has(childDirPath)) {
+                    // Dirty subtree — point at the hash we just built for it.
+                    entries.push({ type: "tree", name: childName, objectHash: newTreeHashes[childDirPath] });
+                } else {
+                    // Clean subtree — reuse the parent commit's hash untouched. A new
+                    // directory would have been marked dirty, so a miss here is a bug.
+                    const reuseHash = parentDirMap[childDirPath];
+                    if (!reuseHash) {
+                        throw new InternalError(
+                            `Bug: clean subtree ${childDirPath} not found in parent commit; new directories must be dirty.`,
+                        );
+                    }
+                    entries.push({ type: "tree", name: childName, objectHash: reuseHash });
+                }
+            }
+
+            // Content-address the tree, then store it (and its entries) only when
+            // this exact hash is new — identical trees dedupe across commits.
+            const treeHash = hashTrees(entries);
+            const exists = await tx.tree.findUnique({ where: { treeHash }, select: { treeHash: true } });
+            if (!exists) {
+                await tx.tree.create({ data: { treeHash } });
+                if (entries.length > 0) {
+                    await tx.treeEntry.createMany({
+                        data: entries.map((e) => ({
+                            parentTree: treeHash,
+                            entryType: e.type,
+                            name: e.name,
+                            objectHash: e.objectHash,
+                        })),
+                    });
+                }
+            }
+
+            newTreeHashes[dirPath] = treeHash;
+        }
+
+        // The root tree hash is the snapshot's identity.
+        return newTreeHashes[""];
+    }
+
+    // getImmediateChildren : collapse the flat path map to the direct children of
+    // `dirPath` (spec 03_commit §2.7). A direct file becomes a blob child; any
+    // deeper path collapses to its top-level subdirectory marked as a tree.
+    private getImmediateChildren(
+        pathMap: PathMap,
+        dirPath: string,
+    ): Map<string, { type: "blob"; hash: string } | { type: "tree" }> {
+        const children = new Map<string, { type: "blob"; hash: string } | { type: "tree" }>();
+
+        for (const [path, info] of Object.entries(pathMap)) {
+            if (path === dirPath || !path.startsWith(dirPath)) continue;
+
+            const relative = path.slice(dirPath.length);
+            const slash = relative.indexOf("/");
+
+            if (info.type === "blob" && slash === -1) {
+                // Direct file in this directory, e.g. "main.py".
+                children.set(relative, { type: "blob", hash: info.hash });
+            } else {
+                // A subdirectory — either its own trailing-slash entry or a nested
+                // file/dir below it. First segment names the immediate child.
+                const childName = slash === -1 ? relative : relative.slice(0, slash);
+                if (!children.has(childName)) children.set(childName, { type: "tree" });
+            }
+        }
+
+        return children;
+    }
+
+    // createCommit : bake a workspace's uncommitted changes into a new commit
+    // (spec 03_commit §2.4). Builds the new tree (reusing clean subtrees), stores
+    // the commit, advances the workspace head with a compare-and-swap, and clears
+    // the now-committed changes — all in one transaction so a half-applied commit
+    // can never land. Ownership and permissions are enforced by the caller.
+    //
+    // The compare-and-swap on `head` (STEP 6) is the only concurrency guard: if a
+    // second commit moved the head after we read it, the CAS matches zero rows and
+    // we abort rather than silently overwriting the first commit.
+    public async createCommit(input: CreateCommitInput): Promise<CreateCommitResult> {
+        const { workspaceId, author, message } = input;
+
+        // STEP 1: load the workspace and validate it can accept a commit.
+        const workspace = await db.prisma.workspace.findUnique({
+            where: { id: workspaceId },
+            select: { head: true, status: true },
+        });
+        if (!workspace) throw new NotFoundError("Workspace not found");
+        if (workspace.status !== "CLEAN") {
+            throw new ConflictError(`Cannot commit while the workspace is ${workspace.status}.`);
+        }
+
+        const changes = await db.prisma.workspaceChange.findMany({
+            where: { workspaceId },
+            select: { filePath: true, action: true, blobHash: true },
+        });
+        if (changes.length === 0) throw new BadRequestError("Nothing to commit — no uncommitted changes.");
+
+        // Parent commit's root tree (null on the first commit of an empty repo,
+        // where every change is necessarily an ADD).
+        const parentHead = workspace.head;
+        const parentCommit = parentHead
+            ? await db.prisma.commit.findUnique({
+                  where: { commitHash: parentHead },
+                  select: { rootTree: true },
+              })
+            : null;
+
+        //  Every ADD/MODIFY must reference an already-uploaded blob (blobs
+        //  are uploaded before the commit request — 01_storage §3.6).
+        const referenced = [
+            ...new Set(changes.filter((c) => c.action !== "DELETE" && c.blobHash).map((c) => c.blobHash as string)),
+        ];
+        if (referenced.length > 0) {
+            const found = await db.prisma.blob.findMany({
+                where: { blobHash: { in: referenced } },
+                select: { blobHash: true },
+            });
+            const foundSet = new Set(found.map((b) => b.blobHash));
+            const missing = referenced.filter((h) => !foundSet.has(h));
+            if (missing.length > 0) {
+                throw new BadRequestError(`Missing blob(s) for commit: ${missing.join(", ")}. Upload the content first.`);
+            }
+        }
+
+        // Timestamp is part of the commit hash as unix seconds (spec §5.5); the
+        // matching Date is stored on the row, in IST like every other timestamp.
+        const committedAt = new Date();
+        const timestamp = Math.floor(committedAt.getTime() / 1000);
+
+        // the new tree objects, the commit row, the
+        // head advance, and the cleared changes either all land or none do.
+        return db.prisma.$transaction(async (tx) => {
+            // STEP 3: rebuild only the trees on dirty paths; reuse the rest by hash.
+            const newRootTree = await this.build_tree_from_changes(
+                { rootTree: parentCommit?.rootTree ?? null },
+                changes,
+                tx,
+            );
+
+            // STEP 4: content-address the commit. Initial commit omits the parent
+            // line entirely, so `parents` is empty when there is no head yet.
+            const parents = parentHead ? [parentHead] : [];
+            const commitHash = hashCommit({
+                rootTree: newRootTree,
+                parents,
+                author,
+                timestamp,
+                timezone: COMMIT_TIMEZONE,
+                message,
+            });
+
+            // STEP 5: store the commit. Upsert on the hash dedups an identical
+            // snapshot (same tree, parent, author, timestamp, message).
+            await tx.commit.upsert({
+                where: { commitHash },
+                update: {},
+                create: {
+                    commitHash,
+                    rootTree: newRootTree,
+                    parent: parentHead,
+                    author: `${author.name} <${author.email}>`,
+                    timestamp: committedAt,
+                    message,
+                    parentWorkspaceId: workspaceId,
+                },
+            });
+
+            // STEP 6: advance the head only if it still points where we read it.
+            const moved = await tx.workspace.updateMany({
+                where: { id: workspaceId, head: parentHead },
+                data: { head: commitHash },
+            });
+            if (moved.count === 0) {
+                throw new ConflictError("Concurrent commit detected — workspace head moved. Retry.");
+            }
+
+            // STEP 7: the changes are now baked into the commit — clear them.
+            await tx.workspaceChange.deleteMany({ where: { workspaceId } });
+
+            return { commitHash, rootTree: newRootTree, parent: parentHead, changeCount: changes.length };
+        });
     }
 }
 

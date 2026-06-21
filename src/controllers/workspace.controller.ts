@@ -1,7 +1,7 @@
 import { NextFunction, Request, Response } from "express";
 import { handleError } from "../middlewares/error.middleware";
 import { BadRequestError, NotFoundError, UnauthorizedError } from "../errors/app.error";
-import { workspaceSchema, listWorkspaceQuerySchema, checkWorkspaceNameSchema, workspaceTreeParamsSchema, workspaceTreeQuerySchema, uploadChangesSchema, blobDownloadParamsSchema } from "../validators/workspace.validators";
+import { workspaceSchema, listWorkspaceQuerySchema, checkWorkspaceNameSchema, workspaceTreeParamsSchema, workspaceTreeQuerySchema, uploadChangesSchema, blobDownloadParamsSchema, createCommitSchema } from "../validators/workspace.validators";
 import db from "../services/database.service";
 import storageService from "../services/storage.service";
 import cloudinaryService from "../services/cloudinary.service";
@@ -11,7 +11,7 @@ import { hashBlobContent } from "../utils/blob.utils";
 // Cap on a single uploaded blob (raw file content). Keeps one request from
 // buffering an unbounded payload into memory; the FE should reject larger files
 // client-side before attempting an upload.
-const MAX_BLOB_BYTES = 25 * 1024 * 1024;
+const MAX_BLOB_BYTES = 10 * 1024 * 1024;
 
 export class WorkspaceController {
     static async createWorkspace(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -106,6 +106,45 @@ export class WorkspaceController {
             });
         } catch (err) {
             handleError("/api/workspace/check/:repoId/:workspaceName", err, next);
+        }
+    }
+
+    // getUncommittedStatus : whether the workspace has any uncommitted changes
+    // pending in workspace_changes. Returns { hasChanges: false } when the working
+    // dir is clean, true otherwise — the FE uses this to enable/disable "Commit".
+    // Repo membership + view permission are enforced by middleware; this also
+    // asserts the workspace belongs to this repo AND to the caller (workspaces are
+    // private per user).
+    static async getUncommittedStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please login to continue");
+
+            const params = workspaceTreeParamsSchema.safeParse(req.params);
+            if (!params.success) throw new BadRequestError(params.error.issues[0].message);
+
+            const { repoId, workspaceId } = params.data;
+
+            const workspace = await db.prisma.workspace.findUnique({
+                where: { id: workspaceId },
+                select: { repoId: true, userId: true },
+            });
+            if (!workspace || workspace.repoId !== repoId || workspace.userId !== req.user.sub) {
+                throw new NotFoundError("Workspace not found");
+            }
+
+            // Existence check only — findFirst stops at the first row, so no full
+            // count is paid just to answer a boolean.
+            const pending = await db.prisma.workspaceChange.findFirst({
+                where: { workspaceId },
+                select: { id: true },
+            });
+
+            res.status(200).json({
+                status: "success",
+                data: { hasChanges: !!pending },
+            });
+        } catch (err) {
+            handleError("/api/workspace/uncommitted/status/:repoId/:workspaceId", err, next);
         }
     }
 

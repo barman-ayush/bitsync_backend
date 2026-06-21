@@ -21,6 +21,17 @@ export type CommitHashInput = {
 
 export type TreeEntryType = "blob" | "tree"
 
+// One node of the flat path map produced by flattening a tree (spec 03_commit
+// §2.5). Files are keyed by their full path ("src/main.py"); directories by the
+// path with a trailing slash ("src/") so an unchanged subtree can be reused by
+// hash during commit rebuilds.
+export type PathMapEntry = {
+    type: TreeEntryType;
+    hash: string;
+}
+
+export type PathMap = Record<string, PathMapEntry>;
+
 export type TreeEntryResponse = {
     name: string;
     id: string;
@@ -63,4 +74,70 @@ export type WorkspaceTreeEntry = {
 export type WorkspaceTree = {
     treeHash: string | null;
     entries: WorkspaceTreeEntry[];
+}
+
+export type ChangeAction = "ADD" | "MODIFY" | "DELETE";
+
+// One workspace change fed into the commit rebuild (spec 03_commit §2.3).
+// Mirrors a `workspace_changes` row: `blobHash` is null for a DELETE, set to the
+// new content's blob for ADD/MODIFY.
+export type BuildTreeChange = {
+    filePath: string;
+    action: ChangeAction;
+    blobHash: string | null;
+}
+
+// Minimal parent-commit shape `build_tree_from_changes` reads: only the root
+// tree hash. `null` means an initial commit on an empty repo — the parent tree
+// is empty, so every change is an ADD. A full Commit row is structurally
+// assignable to this.
+export type ParentCommitRef = {
+    rootTree: string | null;
+}
+
+// Inputs for create_commit (spec 03_commit §2.4). Ownership/permission checks
+// happen in the controller; the service is handed an already-authorised author.
+export type CreateCommitInput = {
+    workspaceId: string;
+    author: CommitIdentity;   // name + email, used both for the hash and the stored author string
+    message: string;
+}
+
+// What the new commit looks like to the caller. `parent` is null for the first
+// commit on an empty repo.
+export type CreateCommitResult = {
+    commitHash: string;
+    rootTree: string;
+    parent: string | null;
+    changeCount: number;
+}
+
+// ---- Commit history endpoint (GET /commit/history/:repoId/:workspaceId) ----
+
+// Request query for listing a workspace's commit history. Keyset pagination:
+// `cursor` is the commitHash of the last entry from the previous page (omit on
+// the first request); `limit` defaults to 20, capped at 100.
+export type CommitHistoryRequest = {
+    cursor?: string;
+    limit?: number;
+}
+
+// One commit in the history list — stored metadata only. The tree contents are
+// fetched separately via the workspace tree endpoints. `timestamp` is an ISO-8601
+// string (the Prisma DateTime serialized in the JSON response).
+export type CommitHistoryEntry = {
+    commitHash: string;
+    parent: string | null;   // null for the initial commit
+    rootTree: string;
+    author: string;          // "Name <email>" as stored
+    message: string;
+    timestamp: string;
+}
+
+// Response envelope, matching the workspace-list shape: entries in `data`,
+// pagination as a sibling. `nextCursor` is null when there are no more pages.
+export type CommitHistoryResponse = {
+    status: "success";
+    data: CommitHistoryEntry[];
+    pagination: { nextCursor: string | null; hasMore: boolean };
 }
