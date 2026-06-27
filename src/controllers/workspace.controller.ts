@@ -126,25 +126,23 @@ export class WorkspaceController {
 
             const workspace = await db.prisma.workspace.findUnique({
                 where: { id: workspaceId },
-                select: { repoId: true, userId: true },
+                select: { repoId: true, userId: true, head: true },
             });
             if (!workspace || workspace.repoId !== repoId || workspace.userId !== req.user.sub) {
                 throw new NotFoundError("Workspace not found");
             }
-
             // Existence check only — findFirst stops at the first row, so no full
             // count is paid just to answer a boolean.
             const pending = await db.prisma.workspaceChange.findFirst({
                 where: { workspaceId },
                 select: { id: true },
             });
-
             res.status(200).json({
                 status: "success",
-                data: { hasChanges: !!pending },
+                data: { status: ((pending) ? "DIRTY" : "CLEAN") },
             });
         } catch (err) {
-            handleError("/api/workspace/uncommitted/status/:repoId/:workspaceId", err, next);
+            handleError("/api/workspace/status/:repoId/:workspaceId", err, next);
         }
     }
 
@@ -184,9 +182,9 @@ export class WorkspaceController {
                 // workspace.head is null -> Workspace created on a empty repository
                 const headCommit = workspace.head
                     ? await db.prisma.commit.findUnique({
-                          where: { commitHash: workspace.head },
-                          select: { rootTree: true },
-                      })
+                        where: { commitHash: workspace.head },
+                        select: { rootTree: true },
+                    })
                     : null;
                 treeHash = headCommit?.rootTree ?? null;
             } else {
@@ -325,11 +323,11 @@ export class WorkspaceController {
             // with no commits yet — every path then resolves as ADD).
             const headRootTree = workspace.head
                 ? (
-                      await db.prisma.commit.findUnique({
-                          where: { commitHash: workspace.head },
-                          select: { rootTree: true },
-                      })
-                  )?.rootTree ?? null
+                    await db.prisma.commit.findUnique({
+                        where: { commitHash: workspace.head },
+                        select: { rootTree: true },
+                    })
+                )?.rootTree ?? null
                 : null;
 
             // Every ADD/MODIFY must reference an already-uploaded blob (01_storage

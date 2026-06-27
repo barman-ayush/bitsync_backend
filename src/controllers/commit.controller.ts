@@ -33,11 +33,28 @@ export class CommitController {
                 throw new NotFoundError("Workspace not found");
             }
 
-            const commit = await storageService.createCommit({
-                workspaceId,
-                author: { name: req.user.name, email: req.user.email },
-                message,
-            });
+            const commit = await db.prisma.$transaction(async (tx) => {
+                const input = {
+                    workspaceId,
+                    author: { name: req.user!.name, email: req.user!.email },
+                    message,
+                };
+                const commit = await storageService.createCommit({ input, tx });
+                const isPROpen = await tx.pullRequest.findFirst({
+                    where: { workspaceId: workspaceId, status: "OPEN" }
+                });
+                if (isPROpen) {
+                    await tx.pullRequest.update({
+                        where: { id: isPROpen.id },
+                        data: {
+                            prHead: commit.commitHash,
+                            updatedAt: new Date()
+                        }
+                    })
+                }
+                return commit;
+            })
+
 
             res.status(201).json({
                 status: "success",

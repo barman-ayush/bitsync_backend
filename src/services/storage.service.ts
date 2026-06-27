@@ -432,6 +432,133 @@ class StorageService {
         return children;
     }
 
+    // getAllParents : return every parent hash for a commit, ordered by ordinal
+    // (spec 01_storage §5.1). Merge commits store their parents in the
+    // `commit_parents` join table; regular commits have a single `parent` field.
+    // Falls back to the scalar parent when no `commit_parents` rows exist, so
+    // all graph walkers can use a single code-path.
+    public async getAllParents(commitHash: string): Promise<string[]> {
+        const mergeParents = await db.prisma.commitParent.findMany({
+            where: { commitHash },
+            select: { parentHash: true },
+            orderBy: { ordinal: "asc" },
+        });
+
+        if (mergeParents.length > 0) {
+            return mergeParents.map((r) => r.parentHash);
+        }
+
+        // Regular (non-merge) commit — fall back to the single parent field.
+        const commit = await db.prisma.commit.findUnique({
+            where: { commitHash },
+            select: { parent: true },
+        });
+        if (commit?.parent) return [commit.parent];
+        return [];
+    }
+
+    // merge_base : Find the LCA using multisource BFS.
+    // convention : commitA -> repoHead, commitB -> workspaceHead
+    public async mergeBase(commitA: string, commitB: string): Promise<string[]> {
+        if (commitA === commitB) return [commitA];
+
+        // commit_hash → depth from the starting tip.
+        console.log("Commit a ", commitA, " Commit b ", commitB);
+        const visitedA = new Map<string, number>([[commitA, 0]]);
+        const visitedB = new Map<string, number>([[commitB, 0]]);
+        let queueA: string[] = [commitA];
+        let queueB: string[] = [commitB];
+        let commitTrail: string[] = [];
+        let isComplete = false;
+        let lowestCommonAncestor: string | null = null;
+
+
+        while (queueA.length > 0 || queueB.length > 0) {
+            // Expand one level from side A.
+            if (queueA.length > 0) {
+                const nextA: string[] = [];
+                for (const current of queueA) {
+                    if (isComplete) break;
+                    const parents = await this.getAllParents(current);
+                    for (const parent of parents) {
+                        if (isComplete) break;
+                        if (visitedB.has(parent)) {
+                            isComplete = true;
+                            break;
+                        }
+                        if (!visitedA.has(parent)) {
+                            visitedA.set(parent, visitedA.get(current)! + 1);
+                            nextA.push(parent);
+                        }
+                    }
+                }
+                queueA = nextA;
+            }
+
+            // Expand one level from side B.
+            if (queueB.length > 0) {
+                const nextB: string[] = [];
+                for (const current of queueB) {
+                    if (isComplete) break;
+                    const parents = await this.getAllParents(current);
+                    for (const parent of parents) {
+                        if (isComplete) break;
+                        if (visitedA.has(parent)) {
+                            // the lca is found and laready visited;
+                            commitTrail.push(parent);
+                            lowestCommonAncestor = parent;
+                            isComplete = true;
+                            break;
+                        }
+                        if (!visitedB.has(parent)) {
+                            visitedB.set(parent, visitedB.get(current)! + 1);
+                            nextB.push(parent);
+                            commitTrail.push(parent);
+                        }
+                    }
+                }
+                queueB = nextB;
+            }
+            if (isComplete) break;
+        }
+        // expected structure : 
+        // [ lca, .... , workspaceHead ]
+        let finalCommitTrail: string[] = [];
+        if (lowestCommonAncestor) {
+            for (const commit of commitTrail) {
+                finalCommitTrail.push(commit);
+                if (commit == lowestCommonAncestor) break;
+            }
+        }
+
+        return finalCommitTrail;
+
+    }
+
+    // isAncestorOf : check if `ancestor` is reachable by walking back from
+    // `descendant` through all parents (spec 01_storage §5.1). Single BFS
+    // that short-circuits the moment the target is found.
+    public async isAncestorOf(ancestor: string, descendant: string): Promise<boolean> {
+        if (ancestor === descendant) return true;
+
+        const visited = new Set<string>();
+        const queue: string[] = [descendant];
+
+        while (queue.length > 0) {
+            const current = queue.pop()!;
+            if (current === ancestor) return true;
+            if (visited.has(current)) continue;
+            visited.add(current);
+
+            const parents = await this.getAllParents(current);
+            for (const parent of parents) {
+                queue.push(parent);
+            }
+        }
+
+        return false;
+    }
+
     // createCommit : bake a workspace's uncommitted changes into a new commit
     // (spec 03_commit §2.4). Builds the new tree (reusing clean subtrees), stores
     // the commit, advances the workspace head with a compare-and-swap, and clears
@@ -441,11 +568,12 @@ class StorageService {
     // The compare-and-swap on `head` (STEP 6) is the only concurrency guard: if a
     // second commit moved the head after we read it, the CAS matches zero rows and
     // we abort rather than silently overwriting the first commit.
-    public async createCommit(input: CreateCommitInput): Promise<CreateCommitResult> {
+    public async createCommit({ input, tx }: { input: CreateCommitInput, tx: Prisma.TransactionClient | null }): Promise<CreateCommitResult> {
         const { workspaceId, author, message } = input;
+        const prismaClient = tx || db.prisma;
 
         // STEP 1: load the workspace and validate it can accept a commit.
-        const workspace = await db.prisma.workspace.findUnique({
+        const workspace = await prismaClient.workspace.findUnique({
             where: { id: workspaceId },
             select: { head: true, status: true },
         });
@@ -454,7 +582,7 @@ class StorageService {
             throw new ConflictError(`Cannot commit while the workspace is ${workspace.status}.`);
         }
 
-        const changes = await db.prisma.workspaceChange.findMany({
+        const changes = await prismaClient.workspaceChange.findMany({
             where: { workspaceId },
             select: { filePath: true, action: true, blobHash: true },
         });
@@ -464,10 +592,10 @@ class StorageService {
         // where every change is necessarily an ADD).
         const parentHead = workspace.head;
         const parentCommit = parentHead
-            ? await db.prisma.commit.findUnique({
-                  where: { commitHash: parentHead },
-                  select: { rootTree: true },
-              })
+            ? await prismaClient.commit.findUnique({
+                where: { commitHash: parentHead },
+                select: { rootTree: true },
+            })
             : null;
 
         //  Every ADD/MODIFY must reference an already-uploaded blob (blobs
@@ -476,7 +604,7 @@ class StorageService {
             ...new Set(changes.filter((c) => c.action !== "DELETE" && c.blobHash).map((c) => c.blobHash as string)),
         ];
         if (referenced.length > 0) {
-            const found = await db.prisma.blob.findMany({
+            const found = await prismaClient.blob.findMany({
                 where: { blobHash: { in: referenced } },
                 select: { blobHash: true },
             });
@@ -494,12 +622,12 @@ class StorageService {
 
         // the new tree objects, the commit row, the
         // head advance, and the cleared changes either all land or none do.
-        return db.prisma.$transaction(async (tx) => {
+        const runTransaction = async (txClient: Prisma.TransactionClient) => {
             // STEP 3: rebuild only the trees on dirty paths; reuse the rest by hash.
             const newRootTree = await this.build_tree_from_changes(
                 { rootTree: parentCommit?.rootTree ?? null },
                 changes,
-                tx,
+                txClient,
             );
 
             // STEP 4: content-address the commit. Initial commit omits the parent
@@ -516,7 +644,7 @@ class StorageService {
 
             // STEP 5: store the commit. Upsert on the hash dedups an identical
             // snapshot (same tree, parent, author, timestamp, message).
-            await tx.commit.upsert({
+            await txClient.commit.upsert({
                 where: { commitHash },
                 update: {},
                 create: {
@@ -531,7 +659,7 @@ class StorageService {
             });
 
             // STEP 6: advance the head only if it still points where we read it.
-            const moved = await tx.workspace.updateMany({
+            const moved = await txClient.workspace.updateMany({
                 where: { id: workspaceId, head: parentHead },
                 data: { head: commitHash },
             });
@@ -540,10 +668,16 @@ class StorageService {
             }
 
             // STEP 7: the changes are now baked into the commit — clear them.
-            await tx.workspaceChange.deleteMany({ where: { workspaceId } });
+            await txClient.workspaceChange.deleteMany({ where: { workspaceId } });
 
             return { commitHash, rootTree: newRootTree, parent: parentHead, changeCount: changes.length };
-        });
+        };
+
+        if (tx) {
+            return runTransaction(tx);
+        } else {
+            return db.prisma.$transaction(runTransaction);
+        }
     }
 }
 

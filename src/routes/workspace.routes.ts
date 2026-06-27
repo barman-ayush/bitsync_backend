@@ -16,8 +16,8 @@ const rawBlobBody = raw({ type: "application/octet-stream", limit: "25mb" });
 router.post("/create/:repoId/:name", requireRepoAccess, authorize("repo:view"), WorkspaceController.createWorkspace);
 router.get("/get-all/:repoId", requireRepoAccess, authorize("repo:view"), WorkspaceController.loadAllWorkspaces);
 router.get("/check/:repoId/:workspaceName", requireRepoAccess, authorize("repo:view"), WorkspaceController.checkWorkspaceName);
-// boolean: does the workspace have any uncommitted changes?
-router.get("/uncommitted/status/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), WorkspaceController.getUncommittedStatus);
+// fetches the status of workspace, whether user can commit/createPR/needs to sync.
+router.get("/status/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), WorkspaceController.getUncommittedStatus);
 // fetches committed + uncommitted changes
 router.get("/tree/get/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), WorkspaceController.getWorkspaceTree);
 // upload raw file content -> returns content-addressed blob hash
