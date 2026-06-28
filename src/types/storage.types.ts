@@ -158,3 +158,50 @@ export type DiffEntry = {
     oldPath?: string;          // only for RENAME — the previous path
     size?: number;             // blob size on PR side (if available)
 }
+
+// ---- Merge Check (GET /pr/merge-check/:repoId/:workspaceId) ----
+
+// How a file changed between the BASE and one side (OURS or THEIRS).
+// Used internally by the three-way merge classify helper (spec §4.2).
+export type MergeChangeClassification = "UNCHANGED" | "ADDED" | "DELETED" | "MODIFIED";
+
+// Conflict types matching the Prisma ConflictType enum (spec §3.2).
+export type MergeConflictType = "EDIT_EDIT" | "DELETE_EDIT" | "ADD_ADD" | "DIR_FILE";
+
+// One conflicted file path in the merge check result.
+export type MergeConflictEntry = {
+    filePath: string;
+    conflictType: MergeConflictType;
+    baseBlob: string | null;   // blob hash in BASE (null if file didn't exist)
+    oursBlob: string | null;   // blob hash in OURS (null if deleted)
+    theirsBlob: string | null; // blob hash in THEIRS (null if deleted)
+}
+
+export type MergedPathEntry = {
+    oldBlobHash?: string | null;
+    newBlobHash: string;
+};
+
+// Full result of the three-way tree merge (spec §4.1). Returned by the
+// merge-check endpoint so the frontend can preview conflicts before creating
+// the PR or triggering the actual merge.
+export type MergeCheckResult = {
+    // Can the merge proceed without user intervention?
+    canMerge: boolean;
+    // True when repo HEAD is an ancestor of workspace HEAD — no 3-way merge needed.
+    isFastForward: boolean;
+    // The three commits that form the merge triangle.
+    baseCommit: string | null;  // LCA commit hash (null only when repo has no commits)
+    oursCommit: string | null;  // repo.headCommit (null if repo is empty)
+    theirsCommit: string;       // workspace.head (pr_head)
+    // Summary stats for quick display.
+    stats: {
+        totalFiles: number;     // total unique file paths across all three trees
+        cleanFiles: number;     // files that auto-merged without conflict
+        conflictCount: number;  // number of conflicted file paths
+    };
+    // Detailed list of conflicted files (empty when canMerge is true).
+    conflicts: MergeConflictEntry[];
+    // The auto-merged path map: filePath -> { oldBlobHash, newBlobHash }. Excludes conflicted paths.
+    mergedPaths: Record<string, MergedPathEntry>;
+}

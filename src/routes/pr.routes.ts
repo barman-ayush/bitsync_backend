@@ -13,6 +13,8 @@ router.post("/create/:repoId/:workspaceId", requireRepoAccess, authorize("repo:p
 router.get("/list/:repoId", requireRepoAccess, authorize("repo:view"), PRController.getAllPRs);
 router.get("/details/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getPrDetails);
 router.get("/diff/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getPrDiff);
+router.get("/merge-check/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), PRController.getMergeCheck);
+router.post("/close/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.closePR);
 router.post("/comment/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.addComment);
 router.delete("/comment/:repoId/:prId/:commentId", requireRepoAccess, authorize("repo:view"), PRController.deleteComment);
 

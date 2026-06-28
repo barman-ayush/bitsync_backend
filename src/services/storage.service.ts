@@ -1,7 +1,7 @@
 import { BadRequestError, ConflictError, InternalError, NotFoundError } from "../errors/app.error";
 import { Prisma } from "../generated/prisma/client";
 import { hashCommit, hashTrees } from "../utils/blob.utils";
-import { BuildTreeChange, CommitIdentity, CreateCommitInput, CreateCommitResult, DiffEntry, ParentCommitRef, PathMap, ResolvedTree, TreeChild, TreeEntryType, WorkspaceTree, WorkspaceTreeEntry } from "../types/storage.types";
+import { BuildTreeChange, CommitIdentity, CreateCommitInput, CreateCommitResult, DiffEntry, MergeChangeClassification, MergeCheckResult, MergeConflictEntry, MergedPathEntry, ParentCommitRef, PathMap, ResolvedTree, TreeChild, TreeEntryType, WorkspaceTree, WorkspaceTreeEntry } from "../types/storage.types";
 import db from "./database.service";
 
 const MAX_DEPTH = 256;
@@ -924,8 +924,288 @@ class StorageService {
 
         return diffs;
     }
-}
 
+    // threeWayTreeMerge : run the full 3-way merge algorithm (spec §4.1) and
+    // return a preview result without writing anything to the database. Used by
+    // the merge-check endpoint so the frontend can show conflicts before the
+    // user triggers the actual merge.
+    //
+    // Inputs:
+    //   oursCommitHash   — repo.headCommit (null if repo is empty → everything is clean ADD)
+    //   theirsCommitHash — workspace.head / pr_head
+    //
+    // Internally computes merge_base to find the BASE commit, then flattens all
+    // three trees and runs the classify/decide matrix per file path.
+    public async threeWayTreeMerge(
+        oursCommitHash: string | null,
+        theirsCommitHash: string,
+    ): Promise<MergeCheckResult> {
+        // ── Edge case: repo has no commits yet ──────────────────────────────
+        // Everything in the workspace is a clean ADD; no conflicts possible.
+        if (!oursCommitHash) {
+            const theirsCommit = await db.prisma.commit.findUnique({
+                where: { commitHash: theirsCommitHash },
+                select: { rootTree: true },
+            });
+            if (!theirsCommit) throw new NotFoundError("Workspace head commit not found");
+
+            const theirsMap = await this.flatten_tree(theirsCommit.rootTree);
+            const mergedPaths: Record<string, MergedPathEntry> = {};
+            let fileCount = 0;
+            for (const [path, info] of Object.entries(theirsMap)) {
+                if (info.type === "blob") {
+                    mergedPaths[path] = { oldBlobHash: null, newBlobHash: info.hash };
+                    fileCount++;
+                }
+            }
+
+            return {
+                canMerge: true,
+                isFastForward: true,
+                baseCommit: null,
+                oursCommit: null,
+                theirsCommit: theirsCommitHash,
+                stats: { totalFiles: fileCount, cleanFiles: fileCount, conflictCount: 0 },
+                conflicts: [],
+                mergedPaths,
+            };
+        }
+
+        // ── Same commit — nothing to merge ──────────────────────────────────
+        if (oursCommitHash === theirsCommitHash) {
+            return {
+                canMerge: true,
+                isFastForward: true,
+                baseCommit: oursCommitHash,
+                oursCommit: oursCommitHash,
+                theirsCommit: theirsCommitHash,
+                stats: { totalFiles: 0, cleanFiles: 0, conflictCount: 0 },
+                conflicts: [],
+                mergedPaths: {},
+            };
+        }
+
+        // ── STEP 1: Compute the merge base (LCA) ───────────────────────────
+        const mergeBaseTrail = await this.mergeBase(oursCommitHash, theirsCommitHash);
+        // mergeBase returns [ lca, ..., workspaceHead ] — element [0] is the LCA
+        // when it is found inside visitedA. If the trail is empty, oursCommit is
+        // unreachable from theirsCommit (disjoint histories); treat as null base.
+        const baseCommitHash = mergeBaseTrail.length > 0 ? mergeBaseTrail[0] : null;
+
+        // ── STEP 2: Detect fast-forward ─────────────────────────────────────
+        if (baseCommitHash === oursCommitHash) {
+            // Repo HEAD is an ancestor of workspace HEAD — fast-forward.
+            const [oursCommit, theirsCommit] = await Promise.all([
+                oursCommitHash ? db.prisma.commit.findUnique({ where: { commitHash: oursCommitHash }, select: { rootTree: true } }) : null,
+                db.prisma.commit.findUnique({ where: { commitHash: theirsCommitHash }, select: { rootTree: true } }),
+            ]);
+            if (!theirsCommit) throw new NotFoundError("Workspace head commit not found");
+
+            const [oursMap, theirsMap] = await Promise.all([
+                this.flatten_tree(oursCommit?.rootTree ?? null),
+                this.flatten_tree(theirsCommit.rootTree),
+            ]);
+
+            const mergedPaths: Record<string, MergedPathEntry> = {};
+            let fileCount = 0;
+            for (const [path, info] of Object.entries(theirsMap)) {
+                if (info.type === "blob") {
+                    mergedPaths[path] = { oldBlobHash: oursMap[path]?.hash ?? null, newBlobHash: info.hash };
+                    fileCount++;
+                }
+            }
+
+            return {
+                canMerge: true,
+                isFastForward: true,
+                baseCommit: baseCommitHash,
+                oursCommit: oursCommitHash,
+                theirsCommit: theirsCommitHash,
+                stats: { totalFiles: fileCount, cleanFiles: fileCount, conflictCount: 0 },
+                conflicts: [],
+                mergedPaths,
+            };
+        }
+
+        // ── STEP 3: Full 3-way merge — flatten all three trees ──────────────
+        const [baseCommit, oursCommit, theirsCommit] = await Promise.all([
+            baseCommitHash
+                ? db.prisma.commit.findUnique({ where: { commitHash: baseCommitHash }, select: { rootTree: true } })
+                : null,
+            db.prisma.commit.findUnique({ where: { commitHash: oursCommitHash }, select: { rootTree: true } }),
+            db.prisma.commit.findUnique({ where: { commitHash: theirsCommitHash }, select: { rootTree: true } }),
+        ]);
+
+        if (!oursCommit) throw new NotFoundError("Repository head commit not found");
+        if (!theirsCommit) throw new NotFoundError("Workspace head commit not found");
+
+        const [baseMap, oursMap, theirsMap] = await Promise.all([
+            this.flatten_tree(baseCommit?.rootTree ?? null),
+            this.flatten_tree(oursCommit.rootTree),
+            this.flatten_tree(theirsCommit.rootTree),
+        ]);
+
+        // ── STEP 4: Collect all unique file paths (exclude directories) ─────
+        const allPaths = new Set<string>();
+        for (const path of Object.keys(baseMap)) {
+            if (baseMap[path].type === "blob") allPaths.add(path);
+        }
+        for (const path of Object.keys(oursMap)) {
+            if (oursMap[path].type === "blob") allPaths.add(path);
+        }
+        for (const path of Object.keys(theirsMap)) {
+            if (theirsMap[path].type === "blob") allPaths.add(path);
+        }
+
+        // ── STEP 5: Classify and decide per path (spec §4.2 / §4.3) ────────
+        const mergedPaths: Record<string, MergedPathEntry> = {};
+        const conflicts: MergeConflictEntry[] = [];
+
+        for (const path of allPaths) {
+            const baseHash = baseMap[path]?.hash ?? null;
+            const oursHash = oursMap[path]?.hash ?? null;
+            const theirsHash = theirsMap[path]?.hash ?? null;
+
+            const changeOurs = this.classifyChange(baseHash, oursHash);
+            const changeTheirs = this.classifyChange(baseHash, theirsHash);
+
+            const decision = this.mergeDecide(
+                changeOurs, changeTheirs,
+                oursHash, theirsHash, baseHash,
+                path,
+            );
+
+            if (decision.type === "RESOLVED") {
+                if (decision.hash !== null) {
+                    mergedPaths[path] = { oldBlobHash: oursHash ?? null, newBlobHash: decision.hash };
+                }
+                // else: file is deleted in the merge — omit from merged tree
+            } else {
+                conflicts.push(decision.conflict);
+            }
+        }
+
+        const totalFiles = allPaths.size;
+        const conflictCount = conflicts.length;
+        const cleanFiles = totalFiles - conflictCount;
+
+        return {
+            canMerge: conflictCount === 0,
+            isFastForward: false,
+            baseCommit: baseCommitHash,
+            oursCommit: oursCommitHash,
+            theirsCommit: theirsCommitHash,
+            stats: { totalFiles, cleanFiles, conflictCount },
+            conflicts,
+            mergedPaths,
+        };
+    }
+
+    // classifyChange : how did a file change between BASE and one side?
+    // (spec §4.2 — "classify" helper)
+    private classifyChange(
+        baseHash: string | null,
+        otherHash: string | null,
+    ): MergeChangeClassification {
+        if (baseHash === null && otherHash === null) return "UNCHANGED";
+        if (baseHash === null && otherHash !== null) return "ADDED";
+        if (baseHash !== null && otherHash === null) return "DELETED";
+        if (baseHash === otherHash) return "UNCHANGED";
+        return "MODIFIED";
+    }
+
+    // mergeDecide : given how each side changed, produce a resolved hash or a
+    // conflict record. Follows the decision table in spec §4.3.
+    private mergeDecide(
+        changeOurs: MergeChangeClassification,
+        changeTheirs: MergeChangeClassification,
+        oursHash: string | null,
+        theirsHash: string | null,
+        baseHash: string | null,
+        path: string,
+    ): { type: "RESOLVED"; hash: string | null } | { type: "CONFLICT"; conflict: MergeConflictEntry } {
+        // ── Neither side changed ──
+        if (changeOurs === "UNCHANGED" && changeTheirs === "UNCHANGED") {
+            return { type: "RESOLVED", hash: baseHash };
+        }
+
+        // ── Only THEIRS changed ──
+        if (changeOurs === "UNCHANGED") {
+            if (changeTheirs === "MODIFIED" || changeTheirs === "ADDED") {
+                return { type: "RESOLVED", hash: theirsHash };
+            }
+            if (changeTheirs === "DELETED") {
+                return { type: "RESOLVED", hash: null };
+            }
+        }
+
+        // ── Only OURS changed ──
+        if (changeTheirs === "UNCHANGED") {
+            if (changeOurs === "MODIFIED" || changeOurs === "ADDED") {
+                return { type: "RESOLVED", hash: oursHash };
+            }
+            if (changeOurs === "DELETED") {
+                return { type: "RESOLVED", hash: null };
+            }
+        }
+
+        // ── Both sides deleted ──
+        if (changeOurs === "DELETED" && changeTheirs === "DELETED") {
+            return { type: "RESOLVED", hash: null };
+        }
+
+        // ── Both sides added ──
+        if (changeOurs === "ADDED" && changeTheirs === "ADDED") {
+            if (oursHash === theirsHash) {
+                return { type: "RESOLVED", hash: oursHash };
+            }
+            return {
+                type: "CONFLICT",
+                conflict: {
+                    filePath: path, conflictType: "ADD_ADD",
+                    baseBlob: null, oursBlob: oursHash, theirsBlob: theirsHash,
+                },
+            };
+        }
+
+        // ── Both sides modified ──
+        if (changeOurs === "MODIFIED" && changeTheirs === "MODIFIED") {
+            if (oursHash === theirsHash) {
+                return { type: "RESOLVED", hash: oursHash };
+            }
+            return {
+                type: "CONFLICT",
+                conflict: {
+                    filePath: path, conflictType: "EDIT_EDIT",
+                    baseBlob: baseHash, oursBlob: oursHash, theirsBlob: theirsHash,
+                },
+            };
+        }
+
+        // ── One deleted, other modified ──
+        if (changeOurs === "DELETED" && changeTheirs === "MODIFIED") {
+            return {
+                type: "CONFLICT",
+                conflict: {
+                    filePath: path, conflictType: "DELETE_EDIT",
+                    baseBlob: baseHash, oursBlob: null, theirsBlob: theirsHash,
+                },
+            };
+        }
+        if (changeOurs === "MODIFIED" && changeTheirs === "DELETED") {
+            return {
+                type: "CONFLICT",
+                conflict: {
+                    filePath: path, conflictType: "DELETE_EDIT",
+                    baseBlob: baseHash, oursBlob: oursHash, theirsBlob: null,
+                },
+            };
+        }
+
+        // Fallback — should be unreachable.
+        return { type: "RESOLVED", hash: baseHash };
+    }
+}
 const storageService = StorageService.getInstance();
 
 export default storageService;

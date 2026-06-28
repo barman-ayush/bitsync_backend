@@ -162,7 +162,47 @@ export class PRController {
                 }
             });
 
-            // #TODO - Notify owners, admins
+            // Notify repository owners and admins (excluding PR author)
+            (async () => {
+                try {
+                    const adminsAndOwners = await db.prisma.repoMember.findMany({
+                        where: {
+                            repoId,
+                            role: { in: ["owner", "admin"] },
+                            deletedAt: null,
+                        },
+                        select: { userId: true }
+                    });
+
+                    const recipients = new Set<string>();
+                    adminsAndOwners.forEach((m) => recipients.add(m.userId));
+                    recipients.add(repositoryActive.ownerId);
+
+                    // Remove PR author from notification recipients
+                    recipients.delete(req.user!.sub);
+
+                    const actorName = (await db.prisma.user.findFirst({ where: { id: req.user?.sub }, select: { displayName: true } }))?.displayName || "Someone";
+
+                    for (const recipientId of recipients) {
+                        await notificationService.notify({
+                            userId: recipientId,
+                            actorId: req.user!.sub,
+                            type: "pr_created",
+                            context: {
+                                actorName,
+                                repoName: repositoryActive.name,
+                                prTitle: title,
+                            },
+                            data: {
+                                repoId,
+                                prId: prCreated.id,
+                            }
+                        });
+                    }
+                } catch (notifyErr) {
+                    // Failures in notification sending are logged and swallowed
+                }
+            })();
 
             res.status(201).json({
                 status: "success",
@@ -500,6 +540,139 @@ export class PRController {
             });
         } catch (err) {
             handleError("/api/pr/comment/:repoId/:prId/:commentId", err, next);
+        }
+    }
+
+    // getMergeCheck : preview the three-way merge result between repo HEAD and
+    // workspace HEAD without creating any database records. The frontend calls
+    // this from the draft PR view so the user can see conflicts before
+    // officially creating or merging the PR.
+    //
+    // Returns: canMerge, isFastForward, conflict list, and summary stats.
+    static async getMergeCheck(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const membership = req.membership?.role;
+            if (!membership) throw new UnauthorizedError("Not enough permission");
+
+            const parsed = prSchema.safeParse(req.params);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { repoId, workspaceId } = parsed.data;
+
+            // Validate repo exists and is active.
+            const repository = await db.prisma.repository.findUnique({
+                where: { id: repoId, isDeleted: false },
+                select: { headCommit: true },
+            });
+            if (!repository) throw new NotFoundError("Repository not found");
+
+            // Load the workspace and verify ownership.
+            const workspace = await db.prisma.workspace.findUnique({
+                where: { id: workspaceId, repoId },
+                select: { head: true, userId: true },
+            });
+            if (!workspace) throw new NotFoundError("Workspace not found");
+
+            // Members can only check their own workspaces.
+            if (membership === "member" && workspace.userId !== req.user.sub) {
+                throw new UnauthorizedError("This workspace does not belong to you");
+            }
+
+            if (!workspace.head) {
+                throw new BadRequestError("Workspace has no commits — nothing to merge");
+            }
+
+            // Run the three-way merge algorithm (read-only preview).
+            const mergeResult = await storageService.threeWayTreeMerge(
+                repository.headCommit,
+                workspace.head,
+            );
+
+            res.status(200).json({
+                status: "success",
+                data: mergeResult,
+            });
+        } catch (err) {
+            handleError("/api/pr/merge-check/:repoId/:workspaceId", err, next);
+        }
+    }
+
+    // closePR : close an OPEN pull request (spec §4.5).
+    // Can only be performed by the PR author or repository admins/owners.
+    static async closePR(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const parsed = prDetailsSchema.safeParse(req.params);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { repoId, prId } = parsed.data;
+
+            const repository = await db.prisma.repository.findUnique({
+                where: { id: repoId, isDeleted: false },
+                select: { id: true, name: true }
+            });
+            if (!repository) throw new NotFoundError("Repository not found");
+
+            const pullRequest = await db.prisma.pullRequest.findFirst({
+                where: { id: prId, repoId }
+            });
+            if (!pullRequest) throw new NotFoundError("Pull Request not found");
+
+            if (pullRequest.status !== "OPEN") {
+                throw new BadRequestError(`Cannot close a PR with status '${pullRequest.status}'. Only OPEN PRs can be closed.`);
+            }
+
+            const membershipRole = req.membership?.role;
+            const isAuthor = pullRequest.authorId === req.user.sub;
+            const isAdminOrOwner = membershipRole === "owner" || membershipRole === "admin";
+
+            if (!isAuthor && !isAdminOrOwner) {
+                throw new ForbiddenError("You do not have permission to close this pull request");
+            }
+
+            const updatedPR = await db.prisma.pullRequest.update({
+                where: { id: prId },
+                data: {
+                    status: "CLOSED",
+                    updatedAt: new Date()
+                }
+            });
+
+            // Notify PR author if closed by someone else
+            if (req.user.sub !== pullRequest.authorId) {
+                (async () => {
+                    try {
+                        const actorName = (await db.prisma.user.findFirst({ where: { id: req.user?.sub }, select: { displayName: true } }))?.displayName || "Someone";
+                        await notificationService.notify({
+                            userId: pullRequest.authorId,
+                            actorId: req.user!.sub,
+                            type: "pr_rejected",
+                            context: {
+                                actorName,
+                                repoName: repository.name,
+                                prTitle: pullRequest.title,
+                            },
+                            data: {
+                                repoId,
+                                prId,
+                                closedBy: req.user!.sub,
+                            }
+                        });
+                    } catch (notifyErr) {
+                        // Log and swallow notification errors
+                    }
+                })();
+            }
+
+            res.status(200).json({
+                status: "success",
+                data: updatedPR
+            });
+        } catch (err) {
+            handleError("/api/pr/close/:repoId/:prId", err, next);
         }
     }
 

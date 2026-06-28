@@ -94,6 +94,14 @@ export const NOTIFICATION_CONTENT: Partial<
         title: `New comment on PR in ${ctx.repoName}`,
         body: `${ctx.actorName} commented on PR "${ctx.prTitle}".`,
     }),
+    pr_created: (ctx) => ({
+        title: `New Pull Request in ${ctx.repoName}`,
+        body: `${ctx.actorName} opened PR "${ctx.prTitle}".`,
+    }),
+    pr_rejected: (ctx) => ({
+        title: `Pull Request closed in ${ctx.repoName}`,
+        body: `${ctx.actorName} closed PR "${ctx.prTitle}".`,
+    }),
 };
 
 // Params for notificationService.notify — one recipient, one templated event.
