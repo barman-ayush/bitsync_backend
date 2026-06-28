@@ -56,6 +56,7 @@ export type NotificationContentContext = {
     role?: string;
     oldRole?: string; // role_changed only
     newRole?: string; // role_changed only
+    prTitle?: string; // pr events
 };
 
 export type NotificationContent = {
@@ -88,6 +89,10 @@ export const NOTIFICATION_CONTENT: Partial<
     role_changed: (ctx) => ({
         title: `Your role in ${ctx.repoName} changed from ${ctx.oldRole} to ${ctx.newRole}`,
         body: `${ctx.actorName} changed your role in ${ctx.repoName} from ${ctx.oldRole} to ${ctx.newRole}.`,
+    }),
+    pr_reviewed: (ctx) => ({
+        title: `New comment on PR in ${ctx.repoName}`,
+        body: `${ctx.actorName} commented on PR "${ctx.prTitle}".`,
     }),
 };
 

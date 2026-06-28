@@ -1,7 +1,7 @@
 import { BadRequestError, ConflictError, InternalError, NotFoundError } from "../errors/app.error";
 import { Prisma } from "../generated/prisma/client";
 import { hashCommit, hashTrees } from "../utils/blob.utils";
-import { BuildTreeChange, CommitIdentity, CreateCommitInput, CreateCommitResult, ParentCommitRef, PathMap, ResolvedTree, TreeChild, TreeEntryType, WorkspaceTree, WorkspaceTreeEntry } from "../types/storage.types";
+import { BuildTreeChange, CommitIdentity, CreateCommitInput, CreateCommitResult, DiffEntry, ParentCommitRef, PathMap, ResolvedTree, TreeChild, TreeEntryType, WorkspaceTree, WorkspaceTreeEntry } from "../types/storage.types";
 import db from "./database.service";
 
 const MAX_DEPTH = 256;
@@ -678,6 +678,251 @@ class StorageService {
         } else {
             return db.prisma.$transaction(runTransaction);
         }
+    }
+
+    // getTreeDiff : recursively compare two tree snapshots and produce a flat
+    // list of file-level changes (ADD, MODIFY, DELETE, RENAME). Identical
+    // subtrees are short-circuited by hash (Merkle optimisation), so only
+    // divergent branches are walked.
+    //
+    // `repoTreeHash` is the root tree of the repo's HEAD commit (null if the
+    // repo has no commits yet — everything in the PR is an ADD).
+    // `prTreeHash` is the root tree of the PR's head commit.
+    // `currentPath` is the directory prefix built as we recurse ("", "src/", …).
+    public async getTreeDiff(
+        repoTreeHash: string | null,
+        prTreeHash: string | null,
+        currentPath: string = "",
+    ): Promise<DiffEntry[]> {
+        // Both null → nothing to compare.
+        if (!repoTreeHash && !prTreeHash) return [];
+
+        // Same hash → identical subtree, no changes at all.
+        if (repoTreeHash === prTreeHash) return [];
+
+        // ── Resolve both sides ──────────────────────────────────────────────
+        const repoEntries = repoTreeHash
+            ? (await this.resolveTrees(repoTreeHash)).entries
+            : [];
+        const prEntries = prTreeHash
+            ? (await this.resolveTrees(prTreeHash)).entries
+            : [];
+
+        // Build lookup maps: name → { type, objectHash, size? }
+        const repoMap = new Map<string, { type: TreeEntryType; objectHash: string; size?: number }>();
+        for (const e of repoEntries) {
+            repoMap.set(e.name, { type: e.type, objectHash: e.objectHash, size: e.size });
+        }
+
+        const prMap = new Map<string, { type: TreeEntryType; objectHash: string; size?: number }>();
+        for (const e of prEntries) {
+            prMap.set(e.name, { type: e.type, objectHash: e.objectHash, size: e.size });
+        }
+
+        // Collect all unique names across both sides.
+        const allNames = new Set<string>([...repoMap.keys(), ...prMap.keys()]);
+
+        const diffs: DiffEntry[] = [];
+
+        // Candidates for rename detection — names that exist on only one side.
+        const deleteCandidates: { name: string; type: TreeEntryType; objectHash: string }[] = [];
+        const addCandidates: { name: string; type: TreeEntryType; objectHash: string; size?: number }[] = [];
+
+        // ── Pass 1: classify each name ──────────────────────────────────────
+        for (const name of allNames) {
+            const repoEntry = repoMap.get(name);
+            const prEntry = prMap.get(name);
+
+            if (repoEntry && prEntry) {
+                // Name exists on BOTH sides.
+                if (repoEntry.objectHash === prEntry.objectHash) {
+                    // Identical content — skip (unchanged).
+                    continue;
+                }
+
+                if (repoEntry.type === "blob" && prEntry.type === "blob") {
+                    // Same name, different blob hash → MODIFY.
+                    diffs.push({
+                        path: currentPath + name,
+                        type: "blob",
+                        changeType: "MODIFY",
+                        oldObjectHash: repoEntry.objectHash,
+                        newObjectHash: prEntry.objectHash,
+                        size: prEntry.size,
+                    });
+                } else if (repoEntry.type === "tree" && prEntry.type === "tree") {
+                    // Both are directories with different hashes → recurse.
+                    const subtreeDiffs = await this.getTreeDiff(
+                        repoEntry.objectHash,
+                        prEntry.objectHash,
+                        currentPath + name + "/",
+                    );
+                    diffs.push(...subtreeDiffs);
+                } else {
+                    // Type mismatch (blob↔tree) — treat as DELETE old + ADD new.
+                    // Expand the old side fully as DELETEs.
+                    if (repoEntry.type === "tree") {
+                        const deleted = await this.expandTreeAsDiff(
+                            repoEntry.objectHash,
+                            currentPath + name + "/",
+                            "DELETE",
+                        );
+                        diffs.push(...deleted);
+                    } else {
+                        diffs.push({
+                            path: currentPath + name,
+                            type: "blob",
+                            changeType: "DELETE",
+                            oldObjectHash: repoEntry.objectHash,
+                        });
+                    }
+                    // Expand the new side fully as ADDs.
+                    if (prEntry.type === "tree") {
+                        const added = await this.expandTreeAsDiff(
+                            prEntry.objectHash,
+                            currentPath + name + "/",
+                            "ADD",
+                        );
+                        diffs.push(...added);
+                    } else {
+                        diffs.push({
+                            path: currentPath + name,
+                            type: "blob",
+                            changeType: "ADD",
+                            newObjectHash: prEntry.objectHash,
+                            size: prEntry.size,
+                        });
+                    }
+                }
+            } else if (repoEntry && !prEntry) {
+                // Name exists ONLY in repo → candidate for DELETE (or rename source).
+                deleteCandidates.push({ name, type: repoEntry.type, objectHash: repoEntry.objectHash });
+            } else if (!repoEntry && prEntry) {
+                // Name exists ONLY in PR → candidate for ADD (or rename target).
+                addCandidates.push({ name, type: prEntry.type, objectHash: prEntry.objectHash, size: prEntry.size });
+            }
+        }
+
+        // ── Pass 2: rename detection among DELETE/ADD candidates ─────────────
+        // A rename is a blob DELETE + blob ADD with the same objectHash.
+        // Build a reverse map: blobHash → deleted candidate(s).
+        const deletedByHash = new Map<string, typeof deleteCandidates[number][]>();
+        for (const d of deleteCandidates) {
+            if (d.type === "blob") {
+                const list = deletedByHash.get(d.objectHash) ?? [];
+                list.push(d);
+                deletedByHash.set(d.objectHash, list);
+            }
+        }
+
+        const matchedDeletes = new Set<string>(); // names consumed by a rename
+
+        for (const addCandidate of addCandidates) {
+            if (addCandidate.type !== "blob") continue;
+
+            const matchingDeletes = deletedByHash.get(addCandidate.objectHash);
+            if (matchingDeletes && matchingDeletes.length > 0) {
+                // Pop the first matching delete — one rename per pair.
+                const matchedDelete = matchingDeletes.shift()!;
+                matchedDeletes.add(matchedDelete.name);
+
+                diffs.push({
+                    path: currentPath + addCandidate.name,
+                    type: "blob",
+                    changeType: "RENAME",
+                    oldObjectHash: matchedDelete.objectHash,
+                    newObjectHash: addCandidate.objectHash,
+                    oldPath: currentPath + matchedDelete.name,
+                    size: addCandidate.size,
+                });
+            }
+        }
+
+        // ── Pass 3: emit remaining (unmatched) DELETEs and ADDs ─────────────
+        for (const d of deleteCandidates) {
+            if (matchedDeletes.has(d.name)) continue; // already consumed by rename
+
+            if (d.type === "tree") {
+                // Deleted directory — expand all files inside as individual DELETEs.
+                const deleted = await this.expandTreeAsDiff(
+                    d.objectHash,
+                    currentPath + d.name + "/",
+                    "DELETE",
+                );
+                diffs.push(...deleted);
+            } else {
+                diffs.push({
+                    path: currentPath + d.name,
+                    type: "blob",
+                    changeType: "DELETE",
+                    oldObjectHash: d.objectHash,
+                });
+            }
+        }
+
+        for (const a of addCandidates) {
+            // Skip if this ADD was already matched as a rename.
+            if (a.type === "blob" && diffs.some(
+                (d) => d.changeType === "RENAME" && d.path === currentPath + a.name,
+            )) {
+                continue;
+            }
+
+            if (a.type === "tree") {
+                // New directory — expand all files inside as individual ADDs.
+                const added = await this.expandTreeAsDiff(
+                    a.objectHash,
+                    currentPath + a.name + "/",
+                    "ADD",
+                );
+                diffs.push(...added);
+            } else {
+                diffs.push({
+                    path: currentPath + a.name,
+                    type: "blob",
+                    changeType: "ADD",
+                    newObjectHash: a.objectHash,
+                    size: a.size,
+                });
+            }
+        }
+
+        return diffs;
+    }
+
+    // expandTreeAsDiff : recursively walk a tree and emit every blob as a
+    // DiffEntry of the given changeType (ADD or DELETE). Used when an entire
+    // directory appears or disappears between the two compared trees.
+    private async expandTreeAsDiff(
+        treeHash: string,
+        prefix: string,
+        changeType: "ADD" | "DELETE",
+    ): Promise<DiffEntry[]> {
+        const entries = (await this.resolveTrees(treeHash)).entries;
+        const diffs: DiffEntry[] = [];
+
+        for (const entry of entries) {
+            if (entry.type === "blob") {
+                diffs.push({
+                    path: prefix + entry.name,
+                    type: "blob",
+                    changeType,
+                    ...(changeType === "DELETE"
+                        ? { oldObjectHash: entry.objectHash }
+                        : { newObjectHash: entry.objectHash, size: entry.size }),
+                });
+            } else {
+                // Recurse into subdirectory.
+                const subDiffs = await this.expandTreeAsDiff(
+                    entry.objectHash,
+                    prefix + entry.name + "/",
+                    changeType,
+                );
+                diffs.push(...subDiffs);
+            }
+        }
+
+        return diffs;
     }
 }
 

@@ -141,3 +141,20 @@ export type CommitHistoryResponse = {
     data: CommitHistoryEntry[];
     pagination: { nextCursor: string | null; hasMore: boolean };
 }
+
+// ---- PR Diff (GET /pr/diff/:repoId/:prId) ----
+
+// The kind of change between two tree snapshots (repo HEAD vs PR HEAD).
+export type DiffChangeType = "ADD" | "MODIFY" | "DELETE" | "RENAME";
+
+// One entry in a PR diff result. Each entry represents a single file-level
+// change between the repo's committed tree and the PR's committed tree.
+export type DiffEntry = {
+    path: string;              // full repo-root-relative path (e.g. "src/utils/foo.ts")
+    type: TreeEntryType;       // "blob" or "tree"
+    changeType: DiffChangeType;
+    oldObjectHash?: string;    // repo-side hash (absent for ADD)
+    newObjectHash?: string;    // PR-side hash (absent for DELETE)
+    oldPath?: string;          // only for RENAME — the previous path
+    size?: number;             // blob size on PR side (if available)
+}

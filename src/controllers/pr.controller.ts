@@ -1,9 +1,10 @@
 import { NextFunction, Request, Response } from "express";
 import { handleError } from "../middlewares/error.middleware";
-import { BadRequestError, NotFoundError, UnauthorizedError } from "../errors/app.error";
-import { createPullRequestSchema, prSchema, listPrQuerySchema } from "../validators/pr.validators";
+import { BadRequestError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors/app.error";
+import { createPullRequestSchema, prSchema, listPrQuerySchema, prDetailsSchema, createCommentSchema, deleteCommentSchema } from "../validators/pr.validators";
 import db from "../services/database.service";
 import storageService from "../services/storage.service";
+import notificationService from "../services/notification.service";
 import { repositoryId } from "../validators/repo.validator";
 
 
@@ -263,6 +264,242 @@ export class PRController {
 
         } catch (err) {
             handleError("/api/pr/list/:repoId", err, next);
+        }
+    }
+    static async getPrDetails(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            const membership = req.membership?.role;
+            if (!req.user || !membership) throw new UnauthorizedError("Unauthorized");
+
+            const parsed = prDetailsSchema.safeParse(req.params);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { repoId, prId } = parsed.data;
+
+            const isRepoActive = await db.prisma.repository.findUnique({ where: { id: repoId, isDeleted: false } });
+
+            if (!isRepoActive) throw new BadRequestError("No such repository exists");
+
+            const pullRequest = await db.prisma.pullRequest.findFirst({
+                where: { repoId, id: prId },
+                include: {
+                    author: true,
+                    workspace: true,
+                    comments: {
+                        include: {
+                            author: {
+                                select: { id: true, username: true, displayName: true, avatarUrl: true }
+                            }
+                        },
+                        orderBy: { createdAt: "asc" }
+                    }
+                }
+            });
+
+            if (!pullRequest) throw new NotFoundError("No such Pull Request found");
+            if ((membership == "member") && (req.user.sub != pullRequest?.authorId)) throw new UnauthorizedError("This PR does not belong to you");
+
+            res.status(200).json({
+                status: "success",
+                data: pullRequest
+            });
+
+
+        } catch (err) {
+            handleError("/api/pr/details/:repoId/:prId", err, next);
+        }
+    }
+
+    static async getPrDiff(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const membership = req.membership?.role;
+            if (!membership) throw new UnauthorizedError("Not enough permission");
+
+            const parsed = prDetailsSchema.safeParse(req.params);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { repoId, prId } = parsed.data;
+
+            // Validate repo exists and is active.
+            const repository = await db.prisma.repository.findUnique({
+                where: { id: repoId, isDeleted: false },
+                select: { headCommit: true },
+            });
+            if (!repository) throw new NotFoundError("Repository not found");
+
+            // Load the PR.
+            const pullRequest = await db.prisma.pullRequest.findFirst({
+                where: { repoId, id: prId },
+                select: { prHead: true, authorId: true },
+            });
+            if (!pullRequest) throw new NotFoundError("Pull Request not found");
+
+            // Members can only view their own PRs.
+            if (membership === "member" && req.user.sub !== pullRequest.authorId) {
+                throw new UnauthorizedError("This PR does not belong to you");
+            }
+
+            // Resolve the root tree for the repo's HEAD (null if repo has no commits).
+            let repoRootTree: string | null = null;
+            if (repository.headCommit) {
+                const repoCommit = await db.prisma.commit.findUnique({
+                    where: { commitHash: repository.headCommit },
+                    select: { rootTree: true },
+                });
+                repoRootTree = repoCommit?.rootTree ?? null;
+            }
+
+            // Resolve the root tree for the PR's head commit.
+            const prCommit = await db.prisma.commit.findUnique({
+                where: { commitHash: pullRequest.prHead },
+                select: { rootTree: true },
+            });
+            if (!prCommit) throw new NotFoundError("PR head commit not found");
+
+            // Compute the diff between the two trees.
+            const diff = await storageService.getTreeDiff(repoRootTree, prCommit.rootTree);
+
+            res.status(200).json({
+                status: "success",
+                data: diff,
+            });
+        } catch (err) {
+            handleError("/api/pr/diff/:repoId/:prId", err, next);
+        }
+    }
+
+    static async addComment(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const parsedParams = prDetailsSchema.safeParse(req.params);
+            if (!parsedParams.success) throw new BadRequestError(parsedParams.error.issues[0].message);
+
+            const parsedBody = createCommentSchema.safeParse(req.body);
+            if (!parsedBody.success) throw new BadRequestError(parsedBody.error.issues[0].message);
+
+            const { repoId, prId } = parsedParams.data;
+            const { body, filePath } = parsedBody.data;
+
+            const repository = await db.prisma.repository.findUnique({
+                where: { id: repoId, isDeleted: false },
+                select: { id: true, name: true, ownerId: true }
+            });
+            if (!repository) throw new NotFoundError("Repository not found");
+
+            const pullRequest = await db.prisma.pullRequest.findFirst({
+                where: { id: prId, repoId },
+                select: { id: true, title: true, authorId: true }
+            });
+            if (!pullRequest) throw new NotFoundError("Pull Request not found");
+
+            const comment = await db.prisma.prComment.create({
+                data: {
+                    prId,
+                    authorId: req.user.sub,
+                    body,
+                    filePath: filePath ?? null,
+                },
+                include: {
+                    author: {
+                        select: { id: true, username: true, displayName: true, avatarUrl: true }
+                    }
+                }
+            });
+
+            // Notify repository owners, admins, and PR author (excluding commenter)
+            (async () => {
+                try {
+                    const adminsAndOwners = await db.prisma.repoMember.findMany({
+                        where: {
+                            repoId,
+                            role: { in: ["owner", "admin"] },
+                            deletedAt: null,
+                        },
+                        select: { userId: true }
+                    });
+
+                    const recipients = new Set<string>();
+                    adminsAndOwners.forEach((m) => recipients.add(m.userId));
+                    recipients.add(repository.ownerId);
+                    recipients.add(pullRequest.authorId);
+
+                    // Remove commenter from notification recipients
+                    recipients.delete(req.user!.sub);
+
+                    const actorName = (await db.prisma.user.findFirst({ where: { id: req.user?.sub }, select: { displayName: true } }))?.displayName || "Someone";
+
+                    // const actorName = req.user!.displayName || req.user!.username || "Someone";
+
+                    for (const recipientId of recipients) {
+                        await notificationService.notify({
+                            userId: recipientId,
+                            actorId: req.user!.sub,
+                            type: "pr_reviewed",
+                            context: {
+                                actorName,
+                                repoName: repository.name,
+                                prTitle: pullRequest.title,
+                            },
+                            data: {
+                                repoId,
+                                prId,
+                                commentId: comment.id,
+                            }
+                        });
+                    }
+                } catch (notifyErr) {
+                    // Failures in notification sending are logged and swallowed
+                }
+            })();
+
+            res.status(201).json({
+                status: "success",
+                data: comment
+            });
+        } catch (err) {
+            handleError("/api/pr/comment/:repoId/:prId", err, next);
+        }
+    }
+
+    static async deleteComment(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const parsed = deleteCommentSchema.safeParse(req.params);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { repoId, prId, commentId } = parsed.data;
+
+            const comment = await db.prisma.prComment.findUnique({
+                where: { id: commentId },
+                include: { pr: true }
+            });
+
+            if (!comment || comment.prId !== prId || comment.pr.repoId !== repoId) {
+                throw new NotFoundError("Comment not found");
+            }
+
+            const membershipRole = req.membership?.role;
+            const isAuthor = comment.authorId === req.user.sub;
+            const isAdminOrOwner = membershipRole === "owner" || membershipRole === "admin";
+
+            if (!isAuthor && !isAdminOrOwner) {
+                throw new ForbiddenError("You do not have permission to delete this comment");
+            }
+
+            await db.prisma.prComment.delete({
+                where: { id: commentId }
+            });
+
+            res.status(200).json({
+                status: "success",
+                message: "Comment deleted successfully"
+            });
+        } catch (err) {
+            handleError("/api/pr/comment/:repoId/:prId/:commentId", err, next);
         }
     }
 
