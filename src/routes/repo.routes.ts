@@ -32,10 +32,11 @@ router.post("/:repoId/remove", requireRepoAccess, authorize("member:remove"), Re
 router.post("/:repoId/promote", requireRepoAccess, authorize("member:promote"), RepoController.promoteUser);
 router.post("/:repoId/demote", requireRepoAccess, authorize("member:demote"), RepoController.demoteUser);
 
+// Repository main line fetch for files.
+router.get("/get-data/:repoId", requireRepoAccess, authorize("repo:view"), RepoController.fetchRepositoryData);
+
 // Page-mount route — slug resolution with the owner join. Keep last: its two
 // param segments would otherwise shadow the more specific tab routes.
 router.get("/:username/:reponame", resolveRepoBySlug, authorize("repo:view"), RepoController.showRepo);
-
-
 
 export default router;

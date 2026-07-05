@@ -1,8 +1,8 @@
 import { NextFunction, Request, Response } from "express";
 import { handleError } from "../middlewares/error.middleware";
-import { BadRequestError, ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors/app.error";
+import { BadRequestError, ConflictError, ForbiddenError, InternalError, NotFoundError, UnauthorizedError } from "../errors/app.error";
 import db from "../services/database.service";
-import { createRepoSchema, invitationBodySchema, inviteUsers, listRepoSchema, memberTargetSchema, repoNameSchema, updateRepoSchema, userRepoRoleChangeSchema } from "../validators/repo.validator";
+import { createRepoSchema, invitationBodySchema, inviteUsers, listRepoSchema, memberTargetSchema, repoNameSchema, repositoryId, repositoryTreeContext, updateRepoSchema, userRepoRoleChangeSchema } from "../validators/repo.validator";
 import { Prisma } from "../generated/prisma/client";
 import notificationService from "../services/notification.service";
 import { InviteByEmailResult, RepoInviteData } from "../types/notification.types";
@@ -623,6 +623,87 @@ export class RepoController {
             });
         } catch (err) {
             handleError("/api/repo/:repoId/demote", err, next);
+        }
+    }
+
+    // This fetches the whole repository data (current main line code).
+    static async fetchRepositoryData(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const parsedRepoId = repositoryId.safeParse(req.params);
+            if (!parsedRepoId.success) throw new BadRequestError("Invalid repository id.");
+
+            const parsedQuery = repositoryTreeContext.safeParse(req.query);
+            if (!parsedQuery.success) throw new BadRequestError("Invalid query.");
+
+            const { repoId } = parsedRepoId.data;
+            const { treeHash } = parsedQuery.data;
+
+            const repository = await db.prisma.repository.findUnique({ where: { id: repoId, isDeleted: false } });
+            if (!repository) throw new NotFoundError("Repository not found.");
+            if (!repository.headCommit) {
+                res.status(200).json({
+                    status: "success",
+                    message: "Empty repository.",
+                    data: {
+                        tree: [],
+                    }
+                });
+                return;
+            }
+
+            let currentLevelObjectHash: string;
+
+            if (treeHash) {
+                const treeExists = await db.prisma.tree.findUnique({ where: { treeHash } });
+                if (!treeExists) throw new NotFoundError("Directory not found.");
+                currentLevelObjectHash = treeHash;
+            } else {
+                const commit = await db.prisma.commit.findUnique({ where: { commitHash: repository.headCommit } });
+                if (!commit) throw new InternalError("Repository head commit not found.");
+                currentLevelObjectHash = commit.rootTree;
+            }
+
+            const entries = await db.prisma.treeEntry.findMany({
+                where: { parentTree: currentLevelObjectHash },
+                orderBy: [
+                    { entryType: "desc" },
+                    { name: "asc" }
+                ]
+            });
+
+            const blobHashes = [
+                ...new Set(entries.filter((e) => e.entryType === "blob").map((e) => e.objectHash)),
+            ];
+
+            const sizeByHash = new Map<string, number>();
+            if (blobHashes.length > 0) {
+                const blobs = await db.prisma.blob.findMany({
+                    where: { blobHash: { in: blobHashes } },
+                    select: { blobHash: true, size: true },
+                });
+                for (const b of blobs) {
+                    sizeByHash.set(b.blobHash, Number(b.size));
+                }
+            }
+
+            const formattedTree = entries.map((e) => ({
+                name: e.name,
+                type: e.entryType,
+                objectHash: e.objectHash,
+                ...(e.entryType === "blob" && { size: sizeByHash.get(e.objectHash) }),
+            }));
+
+            res.status(200).json({
+                status: "success",
+                message: "Repository data fetched successfully.",
+                data: {
+                    tree: formattedTree
+                }
+            });
+        } catch (err) {
+            handleError("/api/repo/:repoId/data", err, next);
         }
     }
 }

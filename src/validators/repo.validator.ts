@@ -4,6 +4,10 @@ export const repositoryId = z.object({
     repoId: z.string().uuid()
 });
 
+export const repositoryTreeContext = z.object({
+    treeHash: z.string().optional()
+});
+
 export const repoContextSchema = z.object({
     reponame: z.string(),
     username: z.string(),
@@ -98,7 +102,7 @@ export const invitationBodySchema = z.object({
 // from the :repoId path param (validated by requireRepoAccess) — the body only
 // names WHO is being acted on.
 export const memberTargetSchema = z.object({
-    userId : z.string().uuid()
+    userId: z.string().uuid()
 })
 
 export type CreateRepoInput = z.infer<typeof createRepoSchema>;

@@ -240,7 +240,10 @@ export class PRController {
 
             if (isActivePR) {
                 if (isActivePR.prHead === workspace.head) status = "IN_SYNC";
-                else status = "PENDING_SYNC";
+                else {
+                    // Should never happen as when we commit, we update it under a transaction.
+                    status = "PENDING_SYNC";
+                }
             }
 
             res.status(200).json({
