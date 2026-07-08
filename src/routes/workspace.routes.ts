@@ -18,7 +18,7 @@ router.get("/get-all/:repoId", requireRepoAccess, authorize("repo:view"), Worksp
 router.get("/check/:repoId/:workspaceName", requireRepoAccess, authorize("repo:view"), WorkspaceController.checkWorkspaceName);
 // fetches the status of workspace, whether user can commit/createPR/needs to sync.
 router.get("/status/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), WorkspaceController.getUncommittedStatus);
-// fetches committed + uncommitted changes
+// fetches committed + uncommitted changes of a given folder level.
 router.get("/tree/get/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), WorkspaceController.getWorkspaceTree);
 // upload raw file content -> returns content-addressed blob hash
 router.post("/blob/:repoId", requireRepoAccess, authorize("repo:push"), rawBlobBody, WorkspaceController.uploadBlob);

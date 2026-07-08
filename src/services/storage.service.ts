@@ -459,11 +459,30 @@ class StorageService {
 
     // merge_base : Find the LCA using multisource BFS.
     // convention : commitA -> repoHead, commitB -> workspaceHead
-    public async mergeBase(commitA: string, commitB: string): Promise<string[]> {
+    // LCA always lies on the main repo commit line (returned null when empty repo)
+    public async mergeBase(commitA: string | null, commitB: string): Promise<(string | null)[]> {
+        if (!commitB) return [];
         if (commitA === commitB) return [commitA];
 
+        // Case: commitA is null (e.g. empty repository mainline)
+        if (commitA === null) {
+            const trail: (string | null)[] = [commitB];
+            let current = commitB;
+            while (true) {
+                const parents = await this.getAllParents(current);
+                if (parents.length === 0) {
+                    break;
+                }
+                current = parents[0];
+                trail.push(current);
+            }
+            trail.push(null);
+            // trail.reverse() = [null, workspace_first_commit , ... , workspaceHead]
+            // LCA is null as mainline is empty, there is no LCA
+            return trail.reverse();
+        }
+
         // commit_hash → depth from the starting tip.
-        console.log("Commit a ", commitA, " Commit b ", commitB);
         const visitedA = new Map<string, number>([[commitA, 0]]);
         const visitedB = new Map<string, number>([[commitB, 0]]);
         let queueA: string[] = [commitA];
@@ -522,7 +541,7 @@ class StorageService {
             if (isComplete) break;
         }
         // expected structure : 
-        // [ lca, .... , workspaceHead ]
+        // [ lowestCommonAncestor, .... , workspaceHead ]
         let finalCommitTrail: string[] = [];
         if (lowestCommonAncestor) {
             for (const commit of commitTrail) {

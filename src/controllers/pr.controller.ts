@@ -6,6 +6,7 @@ import db from "../services/database.service";
 import storageService from "../services/storage.service";
 import notificationService from "../services/notification.service";
 import { repositoryId } from "../validators/repo.validator";
+import { DiffEntry } from "../types/storage.types";
 
 
 export class PRController {
@@ -79,7 +80,7 @@ export class PRController {
             if (!workspaceHead.head) throw new BadRequestError("No head commit found for this workspace");
 
 
-            const workspaceCommitTrail: string[] = await storageService.mergeBase(repoHead.headCommit, workspaceHead.head);
+            const workspaceCommitTrail: (string | null)[] = await storageService.mergeBase(repoHead.headCommit, workspaceHead.head);
 
             if (workspaceCommitTrail.length == 0) throw new BadRequestError("No commit trail found !");
 
@@ -87,7 +88,7 @@ export class PRController {
                 where: {
 
                     commitHash: {
-                        in: workspaceCommitTrail
+                        in: workspaceCommitTrail.filter((c) => c !== null)
                     }
                 },
                 select: {
@@ -157,7 +158,7 @@ export class PRController {
                     description: description,
                     authorId: req.user.sub,
                     prHead: workspaceExists.head!,
-                    status: "OPEN",
+                    status: "DIFFING",
                     createdAt: new Date(),
                 }
             });
@@ -233,13 +234,14 @@ export class PRController {
             if (!repository || !workspace) throw new BadRequestError("No such workspace or repository found");
 
             const isActivePR = await db.prisma.pullRequest.findFirst({
-                where: { repoId, workspaceId, status: "OPEN" }
+                where: { repoId, workspaceId, status: { in: ["OPEN", "DIFFING"] } }
             });
 
             let status = "CREATE_PR";
 
             if (isActivePR) {
-                if (isActivePR.prHead === workspace.head) status = "IN_SYNC";
+                if (isActivePR.status == "DIFFING") status = "DIFFING";
+                else if (isActivePR.prHead === workspace.head) status = "IN_SYNC";
                 else {
                     // Should never happen as when we commit, we update it under a transaction.
                     status = "PENDING_SYNC";
@@ -353,17 +355,17 @@ export class PRController {
         }
     }
 
-    static async getPrDiff(req: Request, res: Response, next: NextFunction): Promise<void> {
+    static async getPrCommitChanges(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please Login");
 
             const membership = req.membership?.role;
             if (!membership) throw new UnauthorizedError("Not enough permission");
 
-            const parsed = prDetailsSchema.safeParse(req.params);
+            const parsed = prSchema.safeParse(req.params);
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
 
-            const { repoId, prId } = parsed.data;
+            const { repoId, workspaceId } = parsed.data;
 
             // Validate repo exists and is active.
             const repository = await db.prisma.repository.findUnique({
@@ -372,37 +374,43 @@ export class PRController {
             });
             if (!repository) throw new NotFoundError("Repository not found");
 
-            // Load the PR.
-            const pullRequest = await db.prisma.pullRequest.findFirst({
-                where: { repoId, id: prId },
-                select: { prHead: true, authorId: true },
+            const workspace = await db.prisma.workspace.findFirst({
+                where: {
+                    id: workspaceId,
+                }
             });
-            if (!pullRequest) throw new NotFoundError("Pull Request not found");
+
+            if (!workspace) throw new NotFoundError("Workspace not found!");
+            if (!workspace.head) throw new BadRequestError("Workspace head not found!");
 
             // Members can only view their own PRs.
-            if (membership === "member" && req.user.sub !== pullRequest.authorId) {
+            if (membership === "member" && req.user.sub !== workspace.userId) {
                 throw new UnauthorizedError("This PR does not belong to you");
             }
 
-            // Resolve the root tree for the repo's HEAD (null if repo has no commits).
-            let repoRootTree: string | null = null;
-            if (repository.headCommit) {
-                const repoCommit = await db.prisma.commit.findUnique({
-                    where: { commitHash: repository.headCommit },
-                    select: { rootTree: true },
-                });
-                repoRootTree = repoCommit?.rootTree ?? null;
-            }
-
             // Resolve the root tree for the PR's head commit.
-            const prCommit = await db.prisma.commit.findUnique({
-                where: { commitHash: pullRequest.prHead },
+            const prCommit = (workspace.head) ? await db.prisma.commit.findUnique({
+                where: { commitHash: workspace.head },
                 select: { rootTree: true },
-            });
+            }) : null;
             if (!prCommit) throw new NotFoundError("PR head commit not found");
 
-            // Compute the diff between the two trees.
-            const diff = await storageService.getTreeDiff(repoRootTree, prCommit.rootTree);
+            // Find the LCA commit trail (repo.headCommit can be null, which mergeBase supports)
+            const baseCommitTrail = await storageService.mergeBase(repository.headCommit, workspace.head);
+            if (baseCommitTrail.length === 0) throw new NotFoundError("No base commit found for workspace");
+            for (let i = 0; i < baseCommitTrail.length; i++) {
+                console.log(i, baseCommitTrail[i]);
+            }
+
+            // Fetch the root tree hash of the LCA commit (baseCommitTrail[0])
+            const baseCommitRecord = await db.prisma.commit.findUnique({
+                where: { commitHash: baseCommitTrail[0] ?? "" },
+                select: { rootTree: true }
+            });
+            const baseTreeHash = baseCommitRecord?.rootTree ?? null;
+
+            // Compute the diff between the LCA tree and the Workspace tree
+            const diff = await storageService.getTreeDiff(baseTreeHash, prCommit.rootTree);
 
             res.status(200).json({
                 status: "success",
@@ -678,5 +686,10 @@ export class PRController {
             handleError("/api/pr/close/:repoId/:prId", err, next);
         }
     }
-
+    static async someFunction(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+        } catch (err) {
+            handleError("/api/pr/changes/:repoId/:prId", err, next);
+        }
+    }
 }

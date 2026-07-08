@@ -310,6 +310,7 @@ model WorkspaceChange {
 enum PrStatus {
   OPEN
   MERGED
+  DIFFING
   CLOSED
 
   @@map("pr_status")
