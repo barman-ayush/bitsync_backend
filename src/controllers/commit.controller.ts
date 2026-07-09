@@ -27,10 +27,13 @@ export class CommitController {
 
             const workspace = await db.prisma.workspace.findUnique({
                 where: { id: workspaceId },
-                select: { repoId: true, userId: true },
+                select: { repoId: true, userId: true, status: true },
             });
             if (!workspace || workspace.repoId !== repoId || workspace.userId !== req.user.sub) {
                 throw new NotFoundError("Workspace not found");
+            }
+            if (workspace.status === "CONFLICTED") {
+                throw new BadRequestError("Cannot commit: please resolve conflicts first.");
             }
 
             const commit = await db.prisma.$transaction(async (tx) => {

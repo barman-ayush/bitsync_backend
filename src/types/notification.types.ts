@@ -57,6 +57,7 @@ export type NotificationContentContext = {
     oldRole?: string; // role_changed only
     newRole?: string; // role_changed only
     prTitle?: string; // pr events
+    conflictCount?: number;
 };
 
 export type NotificationContent = {
@@ -101,6 +102,10 @@ export const NOTIFICATION_CONTENT: Partial<
     pr_rejected: (ctx) => ({
         title: `Pull Request closed in ${ctx.repoName}`,
         body: `${ctx.actorName} closed PR "${ctx.prTitle}".`,
+    }),
+    merge_conflicts: (ctx) => ({
+        title: `Conflicts detected in PR for ${ctx.repoName}`,
+        body: `Conflicts detected in PR "${ctx.prTitle}". There are ${ctx.conflictCount} conflicted files.`,
     }),
 };
 

@@ -351,6 +351,7 @@ model PullRequest {
 }
 
 enum ReviewVerdict {
+  PENDING
   APPROVED
   CHANGES_REQUESTED
   COMMENTED

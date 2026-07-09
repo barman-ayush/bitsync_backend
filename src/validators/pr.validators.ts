@@ -8,6 +8,7 @@ export const prSchema = z.object({
 export const createPullRequestSchema = z.object({
     title: z.string().min(1, "Title is required"),
     description: z.string().min(1, "Description is required"),
+    reviewers: z.array(z.string().email()).optional(),
 });
 
 export const listPrQuerySchema = z.object({

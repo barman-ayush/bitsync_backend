@@ -113,6 +113,7 @@ export class PRController {
     static async createPullRequest(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please Login");
+            const userId = req.user.sub;
 
             const parsed = prSchema.safeParse(req.params);
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
@@ -129,7 +130,7 @@ export class PRController {
             });
 
             const workspaceExists = await db.prisma.workspace.findUnique({
-                where: { repoId, id: workspaceId, userId: req.user.sub },
+                where: { repoId, id: workspaceId, userId },
             });
             // Repository validation
             if (!repositoryActive) throw new NotFoundError("No active repository found")
@@ -137,7 +138,7 @@ export class PRController {
             // Workspace Validation
             if (!workspaceExists) throw new NotFoundError("No such Workspace found");
             if (!workspaceExists.head) throw new BadRequestError("Cannot create PR for a empty workspace");
-            if (workspaceExists.repoId != repoId || workspaceExists.userId != req.user.sub) throw new BadRequestError("Invalid workspace");
+            if (workspaceExists.repoId != repoId || workspaceExists.userId != userId) throw new BadRequestError("Invalid workspace");
 
             // if (repositoryActive.headCommit) {
             //     const commitTrail = await storageService.mergeBase(repositoryActive.headCommit, workspaceExists.head);
@@ -153,78 +154,145 @@ export class PRController {
 
             const threeWayMergeResults = await storageService.threeWayTreeMerge(repositoryActive.headCommit, workspaceExists.head);
 
-            // If no conflict , send for review 
-            if (threeWayMergeResults.conflicts.length === 0) {
-                await db.prisma.pullRequest.create({
+            const hasConflicts = threeWayMergeResults.conflicts.length > 0;
+
+            const { reviewers } = parsedBody.data;
+            const reviewerUsers = !hasConflicts
+                ? await db.prisma.user.findMany({
+                    where: { email: { in: reviewers ?? [] } }
+                })
+                : [];
+
+            const { pr: prCreated, mergeStateId } = await db.prisma.$transaction(async (tx) => {
+                const pr = await tx.pullRequest.create({
                     data: {
                         repoId: repoId,
                         workspaceId: workspaceId,
                         title: title,
                         description: description,
-                        authorId: req.user.sub,
+                        authorId: userId,
                         prHead: workspaceExists.head!,
                         status: "OPEN",
                         createdAt: new Date(),
                     }
                 });
 
-            }
+                let mergeStateId: string | null = null;
 
-
-            const prCreated = await db.prisma.pullRequest.create({
-                data: {
-                    repoId: repoId,
-                    workspaceId: workspaceId,
-                    title: title,
-                    description: description,
-                    authorId: req.user.sub,
-                    prHead: workspaceExists.head!,
-                    status: "OPEN",
-                    createdAt: new Date(),
-                }
-            });
-
-            // Notify repository owners and admins (excluding PR author)
-            (async () => {
-                try {
-                    const adminsAndOwners = await db.prisma.repoMember.findMany({
-                        where: {
-                            repoId,
-                            role: { in: ["owner", "admin"] },
-                            deletedAt: null,
-                        },
-                        select: { userId: true }
+                if (hasConflicts) {
+                    const mergeState = await tx.mergeState.create({
+                        data: {
+                            prId: pr.id,
+                            workspaceId: workspaceId,
+                            baseCommit: threeWayMergeResults.baseCommit ?? "",
+                            oursCommit: repositoryActive.headCommit ?? "",
+                            theirsCommit: workspaceExists.head!,
+                            status: "IN_PROGRESS",
+                            mergedTree: null
+                        }
                     });
+                    mergeStateId = mergeState.id;
 
-                    const recipients = new Set<string>();
-                    adminsAndOwners.forEach((m) => recipients.add(m.userId));
-                    recipients.add(repositoryActive.ownerId);
-
-                    // Remove PR author from notification recipients
-                    recipients.delete(req.user!.sub);
-
-                    const actorName = (await db.prisma.user.findFirst({ where: { id: req.user?.sub }, select: { displayName: true } }))?.displayName || "Someone";
-
-                    for (const recipientId of recipients) {
-                        await notificationService.notify({
-                            userId: recipientId,
-                            actorId: req.user!.sub,
-                            type: "pr_created",
-                            context: {
-                                actorName,
-                                repoName: repositoryActive.name,
-                                prTitle: title,
-                            },
-                            data: {
-                                repoId,
-                                prId: prCreated.id,
-                            }
+                    if (threeWayMergeResults.conflicts.length > 0) {
+                        await tx.mergeConflict.createMany({
+                            data: threeWayMergeResults.conflicts.map((conflict) => ({
+                                mergeStateId: mergeState.id,
+                                filePath: conflict.filePath,
+                                conflictType: conflict.conflictType,
+                                baseBlob: conflict.baseBlob,
+                                oursBlob: conflict.oursBlob,
+                                theirsBlob: conflict.theirsBlob,
+                                resolution: "PENDING"
+                            }))
                         });
                     }
-                } catch (notifyErr) {
-                    // Failures in notification sending are logged and swallowed
+
+                    await tx.workspace.update({
+                        where: { id: workspaceId },
+                        data: { status: "CONFLICTED" }
+                    });
+                } else {
+                    if (reviewerUsers.length > 0) {
+                        await tx.prReview.createMany({
+                            data: reviewerUsers.map((u) => ({
+                                prId: pr.id,
+                                reviewerId: u.id,
+                                verdict: "PENDING"
+                            }))
+                        });
+                    }
                 }
-            })();
+
+                return { pr, mergeStateId };
+            });
+
+            if (hasConflicts) {
+                // Notify PR author about conflicts
+                try {
+                    await notificationService.notify({
+                        userId: userId,
+                        actorId: null,
+                        type: "merge_conflicts",
+                        context: {
+                            actorName: "System",
+                            repoName: repositoryActive.name,
+                            prTitle: title,
+                            conflictCount: threeWayMergeResults.conflicts.length
+                        },
+                        data: {
+                            repoId,
+                            prId: prCreated.id,
+                            mergeStateId: mergeStateId ?? ""
+                        }
+                    });
+                } catch (notifyErr) {
+                    // Log and swallow notification errors
+                }
+            } else {
+                // NO CONFLICTS: Send for review to those who are concerned + notification
+
+                (async () => {
+                    try {
+                        const adminsAndOwners = await db.prisma.repoMember.findMany({
+                            where: {
+                                repoId,
+                                role: { in: ["owner", "admin"] },
+                                deletedAt: null,
+                            },
+                            select: { userId: true }
+                        });
+
+                        const recipients = new Set<string>();
+                        adminsAndOwners.forEach((m) => recipients.add(m.userId));
+                        recipients.add(repositoryActive.ownerId);
+                        reviewerUsers.forEach((u) => recipients.add(u.id));
+
+                        // Remove PR author from recipients
+                        recipients.delete(req.user!.sub);
+
+                        const actorName = (await db.prisma.user.findFirst({ where: { id: req.user?.sub }, select: { displayName: true } }))?.displayName || "Someone";
+
+                        for (const recipientId of recipients) {
+                            await notificationService.notify({
+                                userId: recipientId,
+                                actorId: req.user!.sub,
+                                type: "pr_created",
+                                context: {
+                                    actorName,
+                                    repoName: repositoryActive.name,
+                                    prTitle: title,
+                                },
+                                data: {
+                                    repoId,
+                                    prId: prCreated.id,
+                                }
+                            });
+                        }
+                    } catch (notifyErr) {
+                        // Log and swallow notification errors
+                    }
+                })();
+            }
 
             res.status(201).json({
                 status: "success",
