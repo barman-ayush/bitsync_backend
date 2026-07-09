@@ -105,8 +105,13 @@ export const memberTargetSchema = z.object({
     userId: z.string().uuid()
 })
 
+export const reviewerSearchQuerySchema = z.object({
+    q: z.string().trim().optional()
+})
+
 export type CreateRepoInput = z.infer<typeof createRepoSchema>;
 export type UpdateRepoInput = z.infer<typeof updateRepoSchema>;
 export type UserRepoRoleChangeInput = z.infer<typeof userRepoRoleChangeSchema>;
 export type ListRepoInput = z.infer<typeof listRepoSchema>;
 export type InviteUsersInput = z.infer<typeof inviteUsers>;
+export type ReviewerSearchQueryInput = z.infer<typeof reviewerSearchQuerySchema>;

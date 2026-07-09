@@ -2,7 +2,7 @@ import { NextFunction, Request, Response } from "express";
 import { handleError } from "../middlewares/error.middleware";
 import { BadRequestError, ConflictError, ForbiddenError, InternalError, NotFoundError, UnauthorizedError } from "../errors/app.error";
 import db from "../services/database.service";
-import { createRepoSchema, invitationBodySchema, inviteUsers, listRepoSchema, memberTargetSchema, repoNameSchema, repositoryId, repositoryTreeContext, updateRepoSchema, userRepoRoleChangeSchema } from "../validators/repo.validator";
+import { createRepoSchema, invitationBodySchema, inviteUsers, listRepoSchema, memberTargetSchema, repoNameSchema, repositoryId, repositoryTreeContext, updateRepoSchema, userRepoRoleChangeSchema, reviewerSearchQuerySchema } from "../validators/repo.validator";
 import { Prisma } from "../generated/prisma/client";
 import notificationService from "../services/notification.service";
 import { InviteByEmailResult, RepoInviteData } from "../types/notification.types";
@@ -704,6 +704,70 @@ export class RepoController {
             });
         } catch (err) {
             handleError("/api/repo/:repoId/data", err, next);
+        }
+    }
+
+    // searchReviewers - Queries the active members (contributors) of the repo matching search query.
+    static async searchReviewers(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Not authenticated");
+
+            const repoId = req.repoId;
+            if (!repoId) throw new BadRequestError("Repository id is required.");
+
+            const parsedQuery = reviewerSearchQuerySchema.safeParse(req.query);
+            if (!parsedQuery.success) throw new BadRequestError(parsedQuery.error.issues[0].message);
+
+            const { q } = parsedQuery.data;
+
+            const whereClause: Prisma.RepoMemberWhereInput = {
+                repoId,
+                deletedAt: null,
+                userId: { not: req.user.sub },
+            };
+
+            if (q) {
+                whereClause.user = {
+                    OR: [
+                        { displayName: { contains: q, mode: "insensitive" } },
+                        { email: { contains: q, mode: "insensitive" } },
+                        { usernameNormalized: { contains: q.toLowerCase(), mode: "insensitive" } }
+                    ]
+                };
+            }
+
+            const contributors = await db.prisma.repoMember.findMany({
+                where: whereClause,
+                take: 10,
+                select: {
+                    role: true,
+                    user: {
+                        select: {
+                            id: true,
+                            displayName: true,
+                            username: true,
+                            email: true,
+                            avatarUrl: true
+                        }
+                    }
+                }
+            });
+
+            const results = contributors.map(c => ({
+                id: c.user.id,
+                displayName: c.user.displayName,
+                username: c.user.username,
+                email: c.user.email,
+                avatarUrl: c.user.avatarUrl,
+                role: c.role
+            }));
+
+            res.status(200).json({
+                status: "success",
+                data: results
+            });
+        } catch (e) {
+            handleError("api/repo/:repoId/reviewers/search", e, next);
         }
     }
 }

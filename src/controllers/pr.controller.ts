@@ -128,21 +128,21 @@ export class PRController {
                 where: { id: repoId, isDeleted: false }
             });
 
-            if (!repositoryActive) throw new NotFoundError("No active repository found")
-
-
             const workspaceExists = await db.prisma.workspace.findUnique({
                 where: { repoId, id: workspaceId, userId: req.user.sub },
             });
+            // Repository validation
+            if (!repositoryActive) throw new NotFoundError("No active repository found")
+
+            // Workspace Validation
             if (!workspaceExists) throw new NotFoundError("No such Workspace found");
             if (!workspaceExists.head) throw new BadRequestError("Cannot create PR for a empty workspace");
-
             if (workspaceExists.repoId != repoId || workspaceExists.userId != req.user.sub) throw new BadRequestError("Invalid workspace");
 
-            if (repositoryActive.headCommit) {
-                const commitTrail = await storageService.mergeBase(repositoryActive.headCommit, workspaceExists.head);
-                if (commitTrail[0] == workspaceExists.head) throw new BadRequestError("Cannot create PR for empty workspace, need at least one commit.");
-            }
+            // if (repositoryActive.headCommit) {
+            //     const commitTrail = await storageService.mergeBase(repositoryActive.headCommit, workspaceExists.head);
+            //     if (commitTrail[0] == workspaceExists.head) throw new BadRequestError("Cannot create PR for empty workspace, need at least one commit.");
+            // }
             const isActivePR = await db.prisma.pullRequest.findFirst({
                 where: { repoId, workspaceId, status: "OPEN" }
             });
@@ -150,6 +150,27 @@ export class PRController {
 
             const pendingChanges = await db.prisma.workspaceChange.findFirst({ where: { workspaceId: workspaceExists.id } });
             if (pendingChanges) throw new BadRequestError("Pending changes found in workspace, please commit them before creating a PR");
+
+            const threeWayMergeResults = await storageService.threeWayTreeMerge(repositoryActive.headCommit, workspaceExists.head);
+
+            // If no conflict , send for review 
+            if (threeWayMergeResults.conflicts.length === 0) {
+                await db.prisma.pullRequest.create({
+                    data: {
+                        repoId: repoId,
+                        workspaceId: workspaceId,
+                        title: title,
+                        description: description,
+                        authorId: req.user.sub,
+                        prHead: workspaceExists.head!,
+                        status: "OPEN",
+                        createdAt: new Date(),
+                    }
+                });
+
+            }
+
+
             const prCreated = await db.prisma.pullRequest.create({
                 data: {
                     repoId: repoId,
@@ -158,7 +179,7 @@ export class PRController {
                     description: description,
                     authorId: req.user.sub,
                     prHead: workspaceExists.head!,
-                    status: "DIFFING",
+                    status: "OPEN",
                     createdAt: new Date(),
                 }
             });
@@ -237,20 +258,13 @@ export class PRController {
                 where: { repoId, workspaceId, status: { in: ["OPEN", "DIFFING"] } }
             });
 
-            let status = "CREATE_PR";
-
-            if (isActivePR) {
-                if (isActivePR.status == "DIFFING") status = "DIFFING";
-                else if (isActivePR.prHead === workspace.head) status = "IN_SYNC";
-                else {
-                    // Should never happen as when we commit, we update it under a transaction.
-                    status = "PENDING_SYNC";
-                }
-            }
+            const status = (!isActivePR) ? "CREATE_PR" : "VIEW_PR";
 
             res.status(200).json({
                 status: "success",
-                data: status
+                data: {
+                    status, prData: isActivePR
+                }
             });
         } catch (err) {
             handleError("/api/pr/get-status/:repoId/:workspaceId", err, next);

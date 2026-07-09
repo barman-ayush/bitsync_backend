@@ -957,10 +957,11 @@ class StorageService {
     // three trees and runs the classify/decide matrix per file path.
     public async threeWayTreeMerge(
         oursCommitHash: string | null,
-        theirsCommitHash: string,
+        theirsCommitHash: string | null,
     ): Promise<MergeCheckResult> {
         // ── Edge case: repo has no commits yet ──────────────────────────────
         // Everything in the workspace is a clean ADD; no conflicts possible.
+        if (!theirsCommitHash) throw new NotFoundError("No PR head commit found")
         if (!oursCommitHash) {
             const theirsCommit = await db.prisma.commit.findUnique({
                 where: { commitHash: theirsCommitHash },

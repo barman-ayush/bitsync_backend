@@ -22,6 +22,7 @@ router.post("/invite/decline", RepoController.declineInvite);
 // Must be registered before the /:username/:reponame slug route below so their
 // literal second segment ("contributors", ...) takes precedence.
 router.get("/:repoId/contributors", requireRepoAccess, authorize("repo:view"), RepoController.fetchContributors);
+router.get("/:repoId/reviewers/search", requireRepoAccess, authorize("repo:view"), RepoController.searchReviewers);
 router.post("/:repoId/invite", requireRepoAccess, authorize("member:invite"), RepoController.inviteContributors);
 
 // Member management — requireRepoAccess proves the caller is an active member,
