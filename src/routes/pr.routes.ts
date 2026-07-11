@@ -26,6 +26,14 @@ router.get("/commit-changes/:repoId/:workspaceId", requireRepoAccess, authorize(
 // router.get("/merge-check/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), PRController.getMergeCheck);
 
 router.post("/close/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.closePR);
+router.get("/mergeability/:repoId/:workspaceId/:prId", requireRepoAccess, authorize("repo:view"), PRController.checkPrMergeability);
+router.get("/assigned-reviews/:repoId", requireRepoAccess, authorize("repo:view"), PRController.fetchAssignedReviews);
+router.get("/review-view/:repoId/:workspaceId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getReviewerViewData);
+router.get("/reviews/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getPrReviews);
+router.post("/resolve-conflicts/:repoId/:prId", requireRepoAccess, authorize("repo:push"), PRController.resolveConflictsAndMerge);
+router.post("/add-reviewers/:repoId/:prId", requireRepoAccess, authorize("repo:push"), PRController.addReviewers);
+router.post("/submit-review/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.submitReview);
+router.get("/review-status/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getPrReviewStatus);
 router.post("/comment/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.addComment);
 router.delete("/comment/:repoId/:prId/:commentId", requireRepoAccess, authorize("repo:view"), PRController.deleteComment);
 

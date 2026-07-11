@@ -354,7 +354,7 @@ enum ReviewVerdict {
   PENDING
   APPROVED
   CHANGES_REQUESTED
-  COMMENTED
+  PR_CLOSED
 
   @@map("review_verdict")
 }

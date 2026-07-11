@@ -1,12 +1,13 @@
 import { NextFunction, Request, Response } from "express";
 import { handleError } from "../middlewares/error.middleware";
 import { BadRequestError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors/app.error";
-import { createPullRequestSchema, prSchema, listPrQuerySchema, prDetailsSchema, createCommentSchema, deleteCommentSchema } from "../validators/pr.validators";
+import { createPullRequestSchema, prSchema, listPrQuerySchema, prDetailsSchema, createCommentSchema, deleteCommentSchema, resolveConflictsSchema, prMergeabilitySchema, listAssignedReviewsSchema, listAssignedReviewsQuerySchema, reviewerPrViewSchema, addReviewersSchema, submitReviewSchema, prReviewStatusSchema } from "../validators/pr.validators";
+import { hashCommit } from "../utils/blob.utils";
 import db from "../services/database.service";
 import storageService from "../services/storage.service";
 import notificationService from "../services/notification.service";
 import { repositoryId } from "../validators/repo.validator";
-import { DiffEntry } from "../types/storage.types";
+import { DiffEntry, BuildTreeChange } from "../types/storage.types";
 
 
 export class PRController {
@@ -140,6 +141,19 @@ export class PRController {
             if (!workspaceExists.head) throw new BadRequestError("Cannot create PR for a empty workspace");
             if (workspaceExists.repoId != repoId || workspaceExists.userId != userId) throw new BadRequestError("Invalid workspace");
 
+            // Validate reviewers array
+            const { reviewers } = parsedBody.data;
+            if (!reviewers || reviewers.length === 0) {
+                throw new BadRequestError("At least one reviewer is required.");
+            }
+
+            const reviewerUsers = await db.prisma.user.findMany({
+                where: { email: { in: reviewers } }
+            });
+            const reviewerUserIds = reviewerUsers.map((u) => u.id);
+
+            const validReviewerUsers = await PRController.validateReviewersHelper(repoId, reviewerUserIds, userId);
+
             // if (repositoryActive.headCommit) {
             //     const commitTrail = await storageService.mergeBase(repositoryActive.headCommit, workspaceExists.head);
             //     if (commitTrail[0] == workspaceExists.head) throw new BadRequestError("Cannot create PR for empty workspace, need at least one commit.");
@@ -156,13 +170,6 @@ export class PRController {
 
             const hasConflicts = threeWayMergeResults.conflicts.length > 0;
 
-            const { reviewers } = parsedBody.data;
-            const reviewerUsers = !hasConflicts
-                ? await db.prisma.user.findMany({
-                    where: { email: { in: reviewers ?? [] } }
-                })
-                : [];
-
             const { pr: prCreated, mergeStateId } = await db.prisma.$transaction(async (tx) => {
                 const pr = await tx.pullRequest.create({
                     data: {
@@ -178,6 +185,15 @@ export class PRController {
                 });
 
                 let mergeStateId: string | null = null;
+
+                // Create PrReview records for all valid reviewers
+                await tx.prReview.createMany({
+                    data: validReviewerUsers.map((u) => ({
+                        prId: pr.id,
+                        reviewerId: u.id,
+                        verdict: "PENDING"
+                    }))
+                });
 
                 if (hasConflicts) {
                     const mergeState = await tx.mergeState.create({
@@ -211,16 +227,6 @@ export class PRController {
                         where: { id: workspaceId },
                         data: { status: "CONFLICTED" }
                     });
-                } else {
-                    if (reviewerUsers.length > 0) {
-                        await tx.prReview.createMany({
-                            data: reviewerUsers.map((u) => ({
-                                prId: pr.id,
-                                reviewerId: u.id,
-                                verdict: "PENDING"
-                            }))
-                        });
-                    }
                 }
 
                 return { pr, mergeStateId };
@@ -265,7 +271,7 @@ export class PRController {
                         const recipients = new Set<string>();
                         adminsAndOwners.forEach((m) => recipients.add(m.userId));
                         recipients.add(repositoryActive.ownerId);
-                        reviewerUsers.forEach((u) => recipients.add(u.id));
+                        validReviewerUsers.forEach((u) => recipients.add(u.id));
 
                         // Remove PR author from recipients
                         recipients.delete(req.user!.sub);
@@ -323,7 +329,7 @@ export class PRController {
             if (!repository || !workspace) throw new BadRequestError("No such workspace or repository found");
 
             const isActivePR = await db.prisma.pullRequest.findFirst({
-                where: { repoId, workspaceId, status: { in: ["OPEN", "DIFFING"] } }
+                where: { repoId, workspaceId, status: { in: ["OPEN"] } }
             });
 
             const status = (!isActivePR) ? "CREATE_PR" : "VIEW_PR";
@@ -437,6 +443,79 @@ export class PRController {
         }
     }
 
+    static async validateReviewersHelper(
+        repoId: string,
+        reviewerUserIds: string[],
+        authorId: string
+    ): Promise<any[]> {
+        if (reviewerUserIds.length === 0) {
+            throw new BadRequestError("At least one reviewer is required.");
+        }
+
+        const reviewerUsers = await db.prisma.user.findMany({
+            where: { id: { in: reviewerUserIds } }
+        });
+
+        if (reviewerUsers.length === 0) {
+            throw new BadRequestError("No valid users found for the provided reviewer IDs.");
+        }
+
+        // Filter for members of the repo who are admin or owner (at least admins)
+        const validMembers = await db.prisma.repoMember.findMany({
+            where: {
+                repoId,
+                userId: { in: reviewerUserIds },
+                role: { in: ["admin", "owner"] },
+                deletedAt: null
+            }
+        });
+
+        if (validMembers.length === 0) {
+            throw new BadRequestError("At least one valid reviewer (repo owner or admin) is required.");
+        }
+
+        // Map validReviewerUsers to only those who are valid members and not the author
+        const validMemberUserIds = new Set(validMembers.map((m) => m.userId));
+        const validReviewerUsers = reviewerUsers.filter((u) => validMemberUserIds.has(u.id) && u.id !== authorId);
+
+        if (validReviewerUsers.length === 0) {
+            throw new BadRequestError("You cannot assign yourself or non-admin members as reviewers.");
+        }
+
+        return validReviewerUsers;
+    }
+
+    static async getPrChangesHelper(repoId: string, workspaceId: string): Promise<DiffEntry[]> {
+        const repository = await db.prisma.repository.findUnique({
+            where: { id: repoId, isDeleted: false },
+            select: { headCommit: true },
+        });
+        if (!repository) throw new NotFoundError("Repository not found");
+
+        const workspace = await db.prisma.workspace.findUnique({
+            where: { id: workspaceId }
+        });
+        if (!workspace) throw new NotFoundError("Workspace not found!");
+        if (!workspace.head) throw new BadRequestError("Workspace head not found!");
+
+        const prCommit = await db.prisma.commit.findUnique({
+            where: { commitHash: workspace.head },
+            select: { rootTree: true },
+        });
+        if (!prCommit) throw new NotFoundError("PR head commit not found");
+
+        const baseCommitTrail = await storageService.mergeBase(repository.headCommit, workspace.head);
+        if (baseCommitTrail.length === 0) throw new NotFoundError("No base commit found for workspace");
+
+        const baseCommitRecord = await db.prisma.commit.findUnique({
+            where: { commitHash: baseCommitTrail[0] ?? "" },
+            select: { rootTree: true }
+        });
+        const baseTreeHash = baseCommitRecord?.rootTree ?? null;
+
+        return storageService.getTreeDiff(baseTreeHash, prCommit.rootTree);
+    }
+
     static async getPrCommitChanges(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please Login");
@@ -449,50 +528,18 @@ export class PRController {
 
             const { repoId, workspaceId } = parsed.data;
 
-            // Validate repo exists and is active.
-            const repository = await db.prisma.repository.findUnique({
-                where: { id: repoId, isDeleted: false },
-                select: { headCommit: true },
-            });
-            if (!repository) throw new NotFoundError("Repository not found");
-
-            const workspace = await db.prisma.workspace.findFirst({
-                where: {
-                    id: workspaceId,
-                }
-            });
-
-            if (!workspace) throw new NotFoundError("Workspace not found!");
-            if (!workspace.head) throw new BadRequestError("Workspace head not found!");
-
             // Members can only view their own PRs.
-            if (membership === "member" && req.user.sub !== workspace.userId) {
-                throw new UnauthorizedError("This PR does not belong to you");
+            if (membership === "member") {
+                const workspace = await db.prisma.workspace.findUnique({
+                    where: { id: workspaceId },
+                    select: { userId: true }
+                });
+                if (!workspace || req.user.sub !== workspace.userId) {
+                    throw new UnauthorizedError("This PR does not belong to you");
+                }
             }
 
-            // Resolve the root tree for the PR's head commit.
-            const prCommit = (workspace.head) ? await db.prisma.commit.findUnique({
-                where: { commitHash: workspace.head },
-                select: { rootTree: true },
-            }) : null;
-            if (!prCommit) throw new NotFoundError("PR head commit not found");
-
-            // Find the LCA commit trail (repo.headCommit can be null, which mergeBase supports)
-            const baseCommitTrail = await storageService.mergeBase(repository.headCommit, workspace.head);
-            if (baseCommitTrail.length === 0) throw new NotFoundError("No base commit found for workspace");
-            for (let i = 0; i < baseCommitTrail.length; i++) {
-                console.log(i, baseCommitTrail[i]);
-            }
-
-            // Fetch the root tree hash of the LCA commit (baseCommitTrail[0])
-            const baseCommitRecord = await db.prisma.commit.findUnique({
-                where: { commitHash: baseCommitTrail[0] ?? "" },
-                select: { rootTree: true }
-            });
-            const baseTreeHash = baseCommitRecord?.rootTree ?? null;
-
-            // Compute the diff between the LCA tree and the Workspace tree
-            const diff = await storageService.getTreeDiff(baseTreeHash, prCommit.rootTree);
+            const diff = await PRController.getPrChangesHelper(repoId, workspaceId);
 
             res.status(200).json({
                 status: "success",
@@ -527,11 +574,22 @@ export class PRController {
                 select: { id: true, title: true, authorId: true }
             });
             if (!pullRequest) throw new NotFoundError("Pull Request not found");
+            const userId = req.user.sub;
+            const isPrAuthor = pullRequest.authorId === userId;
+            const isRepoOwner = repository.ownerId === userId;
+
+            const isAssignedReviewer = await db.prisma.prReview.findFirst({
+                where: { prId, reviewerId: userId }
+            });
+
+            if (!isPrAuthor && !isRepoOwner && !isAssignedReviewer) {
+                throw new ForbiddenError("You do not have permission to comment on this Pull Request. Only the PR author, assigned reviewers, or repository owner can comment.");
+            }
 
             const comment = await db.prisma.prComment.create({
                 data: {
                     prId,
-                    authorId: req.user.sub,
+                    authorId: userId,
                     body,
                     filePath: filePath ?? null,
                 },
@@ -726,12 +784,43 @@ export class PRController {
                 throw new ForbiddenError("You do not have permission to close this pull request");
             }
 
-            const updatedPR = await db.prisma.pullRequest.update({
-                where: { id: prId },
-                data: {
-                    status: "CLOSED",
-                    updatedAt: new Date()
+            const updatedPR = await db.prisma.$transaction(async (tx) => {
+                const pr = await tx.pullRequest.update({
+                    where: { id: prId },
+                    data: {
+                        status: "CLOSED",
+                        updatedAt: new Date()
+                    }
+                });
+
+                // Explicitly delete MergeConflicts related to this PR
+                await tx.mergeConflict.deleteMany({
+                    where: {
+                        mergeState: {
+                            prId: prId
+                        }
+                    }
+                });
+
+                // Delete MergeState records for this PR
+                await tx.mergeState.deleteMany({
+                    where: { prId }
+                });
+
+                // Restore workspace status to CLEAN
+                if (pullRequest.workspaceId) {
+                    await tx.workspace.update({
+                        where: { id: pullRequest.workspaceId },
+                        data: { status: "CLEAN" }
+                    });
                 }
+
+                await tx.prReview.updateMany({
+                    where: { prId },
+                    data: { verdict: "PR_CLOSED" }
+                });
+
+                return pr;
             });
 
             // Notify PR author if closed by someone else
@@ -768,10 +857,732 @@ export class PRController {
             handleError("/api/pr/close/:repoId/:prId", err, next);
         }
     }
-    static async someFunction(req: Request, res: Response, next: NextFunction): Promise<void> {
+    static async resolveConflictsAndMerge(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+            const userId = req.user.sub;
+
+            const parsedParams = prDetailsSchema.safeParse(req.params);
+            if (!parsedParams.success) throw new BadRequestError(parsedParams.error.issues[0].message);
+
+            const parsedBody = resolveConflictsSchema.safeParse(req.body);
+            if (!parsedBody.success) throw new BadRequestError(parsedBody.error.issues[0].message);
+
+            const { repoId, prId } = parsedParams.data;
+            const { resolutions } = parsedBody.data;
+
+            // 1. Fetch Pull Request and associated data
+            const pr = await db.prisma.pullRequest.findFirst({
+                where: { id: prId, repoId },
+                include: {
+                    workspace: true,
+                    repo: true,
+                    mergeStates: {
+                        where: { status: "IN_PROGRESS" },
+                        include: { conflicts: true }
+                    }
+                }
+            });
+
+            if (!pr) throw new NotFoundError("Pull Request not found");
+            if (pr.status !== "OPEN") throw new BadRequestError("Pull Request is not OPEN");
+            if (!pr.workspace) throw new NotFoundError("Workspace not found");
+
+            const mergeState = pr.mergeStates[0];
+            if (!mergeState) throw new BadRequestError("No active merge state found for this Pull Request");
+
+            // 2. Perform updates inside a transaction to ensure atomicity
+            const mergeCommitHash = await db.prisma.$transaction(async (tx) => {
+                // Update conflicts with resolutions
+                for (const resItem of resolutions) {
+                    const match = mergeState.conflicts.find(c => c.filePath === resItem.filePath);
+                    if (!match) {
+                        throw new BadRequestError(`File path ${resItem.filePath} is not part of the active conflicts`);
+                    }
+
+                    await tx.mergeConflict.update({
+                        where: { id: match.id },
+                        data: {
+                            resolvedBlob: resItem.blobHash,
+                            resolution: "MANUAL",
+                            resolvedAt: new Date()
+                        }
+                    });
+                }
+
+                // Verify all conflicts are now resolved
+                const pendingCount = await tx.mergeConflict.count({
+                    where: {
+                        mergeStateId: mergeState.id,
+                        resolution: "PENDING"
+                    }
+                });
+
+                if (pendingCount > 0) {
+                    throw new BadRequestError(`Cannot merge: there are still ${pendingCount} unresolved conflicts.`);
+                }
+
+                // Re-run 3-way merge to get the cleanly merged path map
+                const mergeResult = await storageService.threeWayTreeMerge(
+                    mergeState.oursCommit,
+                    mergeState.theirsCommit
+                );
+
+                // Fetch all resolved conflicts for this mergeState
+                const resolvedConflicts = await tx.mergeConflict.findMany({
+                    where: { mergeStateId: mergeState.id }
+                });
+
+                // Build a flat path map of the final resolved tree
+                const finalMergedMap: Record<string, string> = {};
+
+                // Add cleanly merged paths
+                for (const [path, entry] of Object.entries(mergeResult.mergedPaths)) {
+                    if (entry.newBlobHash) {
+                        finalMergedMap[path] = entry.newBlobHash;
+                    }
+                }
+
+                // Apply resolved conflicts
+                for (const conflict of resolvedConflicts) {
+                    if (conflict.resolvedBlob) {
+                        finalMergedMap[conflict.filePath] = conflict.resolvedBlob;
+                    } else {
+                        // Resolved as deleted -> remove from the merged tree if present
+                        delete finalMergedMap[conflict.filePath];
+                    }
+                }
+
+                // Load oursCommit root tree entries to compute differences for build_tree_from_changes
+                const oursCommitRecord = await tx.commit.findUnique({
+                    where: { commitHash: mergeState.oursCommit },
+                    select: { rootTree: true }
+                });
+                if (!oursCommitRecord) {
+                    throw new BadRequestError("Repository ours commit record not found");
+                }
+
+                const oursMap = await storageService.flatten_tree(oursCommitRecord.rootTree);
+                const oursBlobs: Record<string, string> = {};
+                for (const [path, info] of Object.entries(oursMap)) {
+                    if (info.type === "blob") {
+                        oursBlobs[path] = info.hash;
+                    }
+                }
+
+                // Compare oursBlobs and finalMergedMap to generate the changes array
+                const changes: BuildTreeChange[] = [];
+
+                // ADDs and MODIFYs
+                for (const [path, newHash] of Object.entries(finalMergedMap)) {
+                    const oldHash = oursBlobs[path];
+                    if (!oldHash) {
+                        changes.push({
+                            filePath: path,
+                            action: "ADD",
+                            blobHash: newHash
+                        });
+                    } else if (oldHash !== newHash) {
+                        changes.push({
+                            filePath: path,
+                            action: "MODIFY",
+                            blobHash: newHash
+                        });
+                    }
+                }
+
+                // DELETEs
+                for (const path of Object.keys(oursBlobs)) {
+                    if (!finalMergedMap[path]) {
+                        changes.push({
+                            filePath: path,
+                            action: "DELETE",
+                            blobHash: null
+                        });
+                    }
+                }
+
+                // Build final root tree hash
+                const finalRootTreeHash = await storageService.build_tree_from_changes(
+                    { rootTree: oursCommitRecord.rootTree },
+                    changes,
+                    tx
+                );
+
+                // Create the Merge Commit
+                const committedAt = new Date();
+                const timestamp = Math.floor(committedAt.getTime() / 1000);
+                const COMMIT_TIMEZONE = "+0530";
+                const message = `Merge PR #${pr.id}: ${pr.title}`;
+
+                const authorIdentity = { name: req.user!.name, email: req.user!.email };
+
+                const newMergeCommitHash = hashCommit({
+                    rootTree: finalRootTreeHash,
+                    parents: [mergeState.oursCommit, mergeState.theirsCommit],
+                    author: authorIdentity,
+                    timestamp,
+                    timezone: COMMIT_TIMEZONE,
+                    message
+                });
+
+                // Insert the new Commit record
+                await tx.commit.create({
+                    data: {
+                        commitHash: newMergeCommitHash,
+                        rootTree: finalRootTreeHash,
+                        parent: mergeState.oursCommit,
+                        author: `${authorIdentity.name} <${authorIdentity.email}>`,
+                        timestamp: committedAt,
+                        message,
+                        parentWorkspaceId: null
+                    }
+                });
+
+                // Insert Commit Parents
+                await tx.commitParent.createMany({
+                    data: [
+                        { commitHash: newMergeCommitHash, parentHash: mergeState.oursCommit, ordinal: 0 },
+                        { commitHash: newMergeCommitHash, parentHash: mergeState.theirsCommit, ordinal: 1 }
+                    ]
+                });
+
+                // Advance repo HEAD with optimistic locking
+                const repoUpdate = await tx.repository.updateMany({
+                    where: { id: repoId, headCommit: mergeState.oursCommit },
+                    data: { headCommit: newMergeCommitHash }
+                });
+                if (repoUpdate.count === 0) {
+                    throw new BadRequestError("Concurrent modification: Repository HEAD advanced. Please abort and retry the merge.");
+                }
+
+                // Freeze snapshot onto PR and set status to MERGED
+                await tx.pullRequest.update({
+                    where: { id: prId },
+                    data: {
+                        status: "MERGED",
+                        baseCommit: mergeState.baseCommit,
+                        mergeCommit: newMergeCommitHash,
+                        updatedAt: new Date()
+                    }
+                });
+
+
+
+                // Update workspace status and head
+                const isWorkspaceFullyMerged = pr.workspace?.head === pr.prHead;
+                const workspaceDataToUpdate: any = {
+                    status: "CLEAN",
+                    updatedAt: new Date()
+                };
+                if (isWorkspaceFullyMerged) {
+                    workspaceDataToUpdate.head = newMergeCommitHash;
+                }
+
+                await tx.workspace.update({
+                    where: { id: pr.workspaceId! },
+                    data: workspaceDataToUpdate
+                });
+
+                // Update MergeState status to RESOLVED
+                await tx.mergeState.update({
+                    where: { id: mergeState.id },
+                    data: {
+                        status: "RESOLVED",
+                        mergedTree: finalRootTreeHash,
+                        updatedAt: new Date()
+                    }
+                });
+
+                return newMergeCommitHash;
+            });
+
+            // 3. Send notifications (outside transaction to prevent lock delays)
+            try {
+                await notificationService.notify({
+                    userId: pr.authorId,
+                    actorId: userId,
+                    type: "pr_merged",
+                    context: {
+                        actorName: req.user!.name,
+                        repoName: pr.repo.name,
+                        prTitle: pr.title
+                    },
+                    data: {
+                        repoId,
+                        prId: pr.id,
+                        mergeCommit: mergeCommitHash
+                    }
+                });
+            } catch (notifyErr) {
+                // Log and swallow notification errors
+            }
+
+            res.status(200).json({
+                status: "success",
+                message: "Conflicts resolved and merge completed successfully.",
+                data: {
+                    mergeCommit: mergeCommitHash
+                }
+            });
+
         } catch (err) {
-            handleError("/api/pr/changes/:repoId/:prId", err, next);
+            handleError("/api/pr/resolve-conflicts/:repoId/:prId", err, next);
+        }
+    }
+
+    static async checkPrMergeability(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const parsed = prMergeabilitySchema.safeParse(req.params);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { repoId, workspaceId, prId } = parsed.data;
+
+            // 1. Fetch Pull Request and validate it exists and is OPEN
+            const pr = await db.prisma.pullRequest.findFirst({
+                where: { id: prId, repoId, workspaceId }
+            });
+            if (!pr) throw new NotFoundError("Pull Request not found");
+            if (pr.status !== "OPEN") {
+                res.status(200).json({
+                    status: "success",
+                    data: {
+                        canMerge: false,
+                        conflictCount: 0,
+                        hasMergeState: false,
+                        prStatus: pr.status
+                    }
+                });
+                return;
+            }
+
+            // 2. Look for any active MergeState associated with this PR
+            const mergeState = await db.prisma.mergeState.findFirst({
+                where: { prId, status: "IN_PROGRESS" }
+            });
+
+            if (!mergeState) {
+                // No active MergeState means no conflicts exist / it is clean to merge
+                res.status(200).json({
+                    status: "success",
+                    data: {
+                        canMerge: true,
+                        conflictCount: 0,
+                        hasMergeState: false
+                    }
+                });
+                return;
+            }
+
+            // 3. Count any merge conflicts that are not resolved (still PENDING)
+            const pendingCount = await db.prisma.mergeConflict.count({
+                where: {
+                    mergeStateId: mergeState.id,
+                    resolution: "PENDING"
+                }
+            });
+
+            const totalCount = await db.prisma.mergeConflict.count({
+                where: {
+                    mergeStateId: mergeState.id
+                }
+            });
+
+            res.status(200).json({
+                status: "success",
+                data: {
+                    canMerge: pendingCount === 0,
+                    conflictCount: pendingCount,
+                    totalConflictCount: totalCount,
+                    hasMergeState: true
+                }
+            });
+
+        } catch (err) {
+            handleError("/api/pr/mergeability/:repoId/:workspaceId/:prId", err, next);
+        }
+    }
+
+    static async fetchAssignedReviews(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+            const userId = req.user.sub;
+
+            const parsedParams = listAssignedReviewsSchema.safeParse(req.params);
+            if (!parsedParams.success) throw new BadRequestError(parsedParams.error.issues[0].message);
+
+            const parsedQuery = listAssignedReviewsQuerySchema.safeParse(req.query);
+            if (!parsedQuery.success) throw new BadRequestError(parsedQuery.error.issues[0].message);
+
+            const { repoId } = parsedParams.data;
+            const { verdict, cursor, limit, q } = parsedQuery.data;
+
+            const reviewFilter: any = {
+                reviewerId: userId,
+                pr: {
+                    repoId: repoId
+                }
+            };
+            if (verdict) {
+                reviewFilter.verdict = verdict;
+            }
+            if (q) {
+                reviewFilter.pr = {
+                    ...reviewFilter.pr,
+                    OR: [
+                        { title: { contains: q, mode: "insensitive" } },
+                        { description: { contains: q, mode: "insensitive" } }
+                    ]
+                };
+            }
+
+            const reviews = await db.prisma.prReview.findMany({
+                where: reviewFilter,
+                orderBy: [
+                    { createdAt: "desc" },
+                    { id: "desc" }
+                ],
+                take: limit + 1,
+                ...(cursor && { cursor: { id: cursor }, skip: 1 }),
+                include: {
+                    pr: {
+                        include: {
+                            author: {
+                                select: {
+                                    id: true,
+                                    displayName: true,
+                                    email: true
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            const hasMore = reviews.length > limit;
+            const activeReviews = hasMore ? reviews.slice(0, limit) : reviews;
+            const nextCursor = hasMore ? activeReviews[activeReviews.length - 1].id : null;
+
+            const pullRequests = activeReviews.map(r => ({
+                ...r.pr,
+                reviewId: r.id,
+                reviewVerdict: r.verdict,
+                reviewCreatedAt: r.createdAt
+            }));
+
+            res.status(200).json({
+                status: "success",
+                data: pullRequests,
+                pagination: {
+                    nextCursor,
+                    hasMore
+                }
+            });
+
+        } catch (err) {
+            handleError("/api/pr/assigned-reviews/:repoId", err, next);
+        }
+    }
+
+    static async getReviewerViewData(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+            const membership = req.membership?.role;
+            if (!membership) throw new UnauthorizedError("Not enough permission");
+
+            const parsed = reviewerPrViewSchema.safeParse(req.params);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { repoId, workspaceId, prId } = parsed.data;
+
+            const pr = await db.prisma.pullRequest.findFirst({
+                where: { id: prId, repoId, workspaceId }
+            });
+            if (!pr) throw new NotFoundError("Pull Request not found");
+
+            // Members can only view their own PRs.
+            if (membership === "member") {
+                const workspace = await db.prisma.workspace.findUnique({
+                    where: { id: workspaceId },
+                    select: { userId: true }
+                });
+                if (!workspace || req.user.sub !== workspace.userId) {
+                    throw new UnauthorizedError("This PR does not belong to you");
+                }
+            }
+
+            // 1. Get all changes for this PR using the helper
+            const allChanges = await PRController.getPrChangesHelper(repoId, workspaceId);
+
+            // 2. Fetch the active or resolved MergeState and its conflicts
+            const mergeState = await db.prisma.mergeState.findFirst({
+                where: {
+                    prId,
+                    status: { in: ["IN_PROGRESS", "RESOLVED"] }
+                },
+                include: {
+                    conflicts: true
+                }
+            });
+
+            // 3. Separate files into conflicted vs normal
+            const conflictedPaths = new Set(mergeState?.conflicts.map(c => c.filePath) ?? []);
+
+            const conflicts = mergeState ? mergeState.conflicts.map(conflict => ({
+                filePath: conflict.filePath,
+                conflictType: conflict.conflictType,
+                baseBlob: conflict.baseBlob,
+                oursBlob: conflict.oursBlob,
+                theirsBlob: conflict.theirsBlob,
+                resolvedBlob: conflict.resolvedBlob,
+                resolution: conflict.resolution,
+                resolvedAt: conflict.resolvedAt
+            })) : [];
+
+            const normalChanges = allChanges.filter(c => !conflictedPaths.has(c.path));
+
+            res.status(200).json({
+                status: "success",
+                data: {
+                    conflicts,
+                    normalChanges
+                }
+            });
+
+        } catch (err) {
+            handleError("/api/pr/review-view/:repoId/:workspaceId/:prId", err, next);
+        }
+    }
+
+    static async addReviewers(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+            const userId = req.user.sub;
+
+            const parsedParams = prDetailsSchema.safeParse(req.params);
+            if (!parsedParams.success) throw new BadRequestError(parsedParams.error.issues[0].message);
+
+            const parsedBody = addReviewersSchema.safeParse(req.body);
+            if (!parsedBody.success) throw new BadRequestError(parsedBody.error.issues[0].message);
+
+            const { repoId, prId } = parsedParams.data;
+            const { reviewerIds } = parsedBody.data;
+
+            const pr = await db.prisma.pullRequest.findFirst({
+                where: { id: prId, repoId },
+                include: {
+                    repo: {
+                        select: { name: true }
+                    }
+                }
+            });
+            if (!pr) throw new NotFoundError("Pull Request not found");
+            if (pr.status !== "OPEN") throw new BadRequestError("Cannot add reviewers to a closed/merged PR");
+
+            const validReviewerUsers = await PRController.validateReviewersHelper(repoId, reviewerIds, userId);
+
+            const existingReviews = await db.prisma.prReview.findMany({
+                where: { prId, reviewerId: { in: validReviewerUsers.map(u => u.id) } }
+            });
+            const existingReviewerIds = new Set(existingReviews.map(r => r.reviewerId));
+
+            const newReviewers = validReviewerUsers.filter(u => !existingReviewerIds.has(u.id));
+
+            if (newReviewers.length > 0) {
+                await db.prisma.prReview.createMany({
+                    data: newReviewers.map(u => ({
+                        prId,
+                        reviewerId: u.id,
+                        verdict: "PENDING"
+                    }))
+                });
+
+                const actorName = (await db.prisma.user.findFirst({ where: { id: userId }, select: { displayName: true } }))?.displayName || "Someone";
+                for (const reviewer of newReviewers) {
+                    try {
+                        await notificationService.notify({
+                            userId: reviewer.id,
+                            actorId: userId,
+                            type: "pr_created",
+                            context: {
+                                actorName,
+                                repoName: pr.repo.name,
+                                prTitle: pr.title
+                            },
+                            data: {
+                                repoId,
+                                prId
+                            }
+                        });
+                    } catch (notifyErr) {
+                        // Swallow notification errors
+                    }
+                }
+            }
+
+            res.status(200).json({
+                status: "success",
+                message: "Reviewers added successfully.",
+                data: {
+                    addedReviewerCount: newReviewers.length
+                }
+            });
+
+        } catch (err) {
+            handleError("/api/pr/add-reviewers/:repoId/:prId", err, next);
+        }
+    }
+
+    static async getPrReviews(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const parsed = prDetailsSchema.safeParse(req.params);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { repoId, prId } = parsed.data;
+
+            const reviews = await db.prisma.prReview.findMany({
+                where: {
+                    prId,
+                    pr: { repoId }
+                },
+                include: {
+                    reviewer: {
+                        select: {
+                            id: true,
+                            displayName: true,
+                            email: true,
+                            avatarUrl: true,
+                            username: true
+                        }
+                    }
+                },
+                orderBy: {
+                    createdAt: "asc"
+                }
+            });
+
+            res.status(200).json({
+                status: "success",
+                data: reviews
+            });
+
+        } catch (err) {
+            handleError("/api/pr/reviews/:repoId/:prId", err, next);
+        }
+    }
+
+    static async submitReview(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+            const userId = req.user.sub;
+
+            const parsedParams = prDetailsSchema.safeParse(req.params);
+            if (!parsedParams.success) throw new BadRequestError(parsedParams.error.issues[0].message);
+
+            const parsedBody = submitReviewSchema.safeParse(req.body);
+            if (!parsedBody.success) throw new BadRequestError(parsedBody.error.issues[0].message);
+
+            const { repoId, prId } = parsedParams.data;
+            const { verdict, body } = parsedBody.data;
+
+            const pr = await db.prisma.pullRequest.findFirst({
+                where: { id: prId, repoId },
+                include: {
+                    repo: {
+                        select: { name: true }
+                    }
+                }
+            });
+            if (!pr) throw new NotFoundError("Pull Request not found");
+            if (pr.status !== "OPEN") throw new BadRequestError("Cannot submit a review for a closed or merged PR");
+
+            const review = await db.prisma.prReview.findFirst({
+                where: { prId, reviewerId: userId }
+            });
+            if (!review) {
+                throw new ForbiddenError("You are not assigned as a reviewer on this Pull Request.");
+            }
+
+            const updatedReview = await db.prisma.prReview.update({
+                where: { id: review.id },
+                data: {
+                    verdict: verdict as any, // Cast to any or ReviewVerdict enum type safely
+                    body: body || null,
+                    createdAt: new Date()
+                }
+            });
+
+            // Notify PR author about this review
+            try {
+                const actorName = (await db.prisma.user.findFirst({ where: { id: userId }, select: { displayName: true } }))?.displayName || "Someone";
+                await notificationService.notify({
+                    userId: pr.authorId,
+                    actorId: userId,
+                    type: "pr_reviewed",
+                    context: {
+                        actorName,
+                        repoName: pr.repo.name,
+                        prTitle: pr.title
+                    },
+                    data: {
+                        repoId,
+                        prId,
+                        reviewId: updatedReview.id,
+                        verdict: updatedReview.verdict
+                    }
+                });
+            } catch (notifyErr) {
+                // Swallow notification errors
+            }
+
+            res.status(200).json({
+                status: "success",
+                message: "PR review submitted successfully.",
+                data: updatedReview
+            });
+
+        } catch (err) {
+            handleError("/api/pr/submit-review/:repoId/:prId", err, next);
+        }
+    }
+
+    static async getPrReviewStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            if (!req.user) throw new UnauthorizedError("Please Login");
+
+            const parsed = prReviewStatusSchema.safeParse(req.params);
+            if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
+
+            const { repoId, prId } = parsed.data;
+            const reviewerId = req.user.sub;
+
+            const review = await db.prisma.prReview.findFirst({
+                where: {
+                    prId,
+                    reviewerId,
+                    pr: { repoId }
+                },
+                select: {
+                    id: true,
+                    verdict: true,
+                    body: true,
+                    createdAt: true
+                }
+            });
+
+            if (!review) throw new NotFoundError("Review record not found for this reviewer and PR.");
+
+            res.status(200).json({
+                status: "success",
+                data: review
+            });
+
+        } catch (err) {
+            handleError("/api/pr/review-status/:repoId/:prId", err, next);
         }
     }
 }
