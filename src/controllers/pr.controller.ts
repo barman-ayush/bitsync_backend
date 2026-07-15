@@ -1,4 +1,5 @@
 import { NextFunction, Request, Response } from "express";
+import { ConflictResolution } from "../generated/prisma/client";
 import { handleError } from "../middlewares/error.middleware";
 import { BadRequestError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors/app.error";
 import { createPullRequestSchema, prSchema, listPrQuerySchema, prDetailsSchema, createCommentSchema, deleteCommentSchema, resolveConflictsSchema, prMergeabilitySchema, listAssignedReviewsSchema, listAssignedReviewsQuerySchema, reviewerPrViewSchema, addReviewersSchema, submitReviewSchema, prReviewStatusSchema } from "../validators/pr.validators";
@@ -857,7 +858,7 @@ export class PRController {
             handleError("/api/pr/close/:repoId/:prId", err, next);
         }
     }
-    static async resolveConflictsAndMerge(req: Request, res: Response, next: NextFunction): Promise<void> {
+    static async resolveConflicts(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please Login");
             const userId = req.user.sub;
@@ -871,7 +872,6 @@ export class PRController {
             const { repoId, prId } = parsedParams.data;
             const { resolutions } = parsedBody.data;
 
-            // 1. Fetch Pull Request and associated data
             const pr = await db.prisma.pullRequest.findFirst({
                 where: { id: prId, repoId },
                 include: {
@@ -886,31 +886,41 @@ export class PRController {
 
             if (!pr) throw new NotFoundError("Pull Request not found");
             if (pr.status !== "OPEN") throw new BadRequestError("Pull Request is not OPEN");
-            if (!pr.workspace) throw new NotFoundError("Workspace not found");
+            if (!pr.workspaceId) throw new NotFoundError("Workspace not found");
 
             const mergeState = pr.mergeStates[0];
-            if (!mergeState) throw new BadRequestError("No active merge state found for this Pull Request");
+            if (!mergeState) throw new BadRequestError("No active merge state found, Please close and open a new pull request");
 
-            // 2. Perform updates inside a transaction to ensure atomicity
-            const mergeCommitHash = await db.prisma.$transaction(async (tx) => {
-                // Update conflicts with resolutions
+            const result = await db.prisma.$transaction(async (tx) => {
+                const dbConflicts = await tx.mergeConflict.findMany({
+                    where: { mergeStateId: mergeState.id }
+                });
+
                 for (const resItem of resolutions) {
-                    const match = mergeState.conflicts.find(c => c.filePath === resItem.filePath);
-                    if (!match) {
-                        throw new BadRequestError(`File path ${resItem.filePath} is not part of the active conflicts`);
+                    const conflict = dbConflicts.find(c => c.id === resItem.conflictId);
+                    if (!conflict) {
+                        throw new BadRequestError(`Conflict ${resItem.conflictId} not found in this merge state`);
+                    }
+
+                    let targetResolvedBlob: string | null = null;
+                    if (resItem.resolution === "TAKE_OURS") {
+                        targetResolvedBlob = conflict.oursBlob;
+                    } else if (resItem.resolution === "TAKE_THEIRS") {
+                        targetResolvedBlob = conflict.theirsBlob;
+                    } else if (resItem.resolution === "MANUAL") {
+                        targetResolvedBlob = resItem.resolvedBlob ?? null;
                     }
 
                     await tx.mergeConflict.update({
-                        where: { id: match.id },
+                        where: { id: conflict.id },
                         data: {
-                            resolvedBlob: resItem.blobHash,
-                            resolution: "MANUAL",
+                            resolution: resItem.resolution,
+                            resolvedBlob: targetResolvedBlob,
                             resolvedAt: new Date()
                         }
                     });
                 }
 
-                // Verify all conflicts are now resolved
                 const pendingCount = await tx.mergeConflict.count({
                     where: {
                         mergeStateId: mergeState.id,
@@ -919,212 +929,153 @@ export class PRController {
                 });
 
                 if (pendingCount > 0) {
-                    throw new BadRequestError(`Cannot merge: there are still ${pendingCount} unresolved conflicts.`);
+                    return {
+                        gitHistoryChanged: false,
+                        pendingConflictCount: pendingCount
+                    };
                 }
 
-                // Re-run 3-way merge to get the cleanly merged path map
-                const mergeResult = await storageService.threeWayTreeMerge(
-                    mergeState.oursCommit,
-                    mergeState.theirsCommit
-                );
+                const [currentWorkspace, currentRepo] = await Promise.all([
+                    tx.workspace.findUnique({
+                        where: { id: pr.workspaceId! },
+                        select: { head: true }
+                    }),
+                    tx.repository.findUnique({
+                        where: { id: repoId },
+                        select: { headCommit: true }
+                    })
+                ]);
 
-                // Fetch all resolved conflicts for this mergeState
-                const resolvedConflicts = await tx.mergeConflict.findMany({
-                    where: { mergeStateId: mergeState.id }
-                });
-
-                // Build a flat path map of the final resolved tree
-                const finalMergedMap: Record<string, string> = {};
-
-                // Add cleanly merged paths
-                for (const [path, entry] of Object.entries(mergeResult.mergedPaths)) {
-                    if (entry.newBlobHash) {
-                        finalMergedMap[path] = entry.newBlobHash;
-                    }
+                if (!currentWorkspace || !currentRepo) {
+                    throw new NotFoundError("Workspace or Repository not found");
                 }
 
-                // Apply resolved conflicts
-                for (const conflict of resolvedConflicts) {
-                    if (conflict.resolvedBlob) {
-                        finalMergedMap[conflict.filePath] = conflict.resolvedBlob;
-                    } else {
-                        // Resolved as deleted -> remove from the merged tree if present
-                        delete finalMergedMap[conflict.filePath];
-                    }
+                const isUpToDate = (currentWorkspace.head === mergeState.theirsCommit) &&
+                    (currentRepo.headCommit === mergeState.oursCommit);
+
+                if (isUpToDate) {
+                    await tx.mergeState.update({
+                        where: { id: mergeState.id },
+                        data: {
+                            status: "RESOLVED",
+                            updatedAt: new Date()
+                        }
+                    });
+                    return {
+                        gitHistoryChanged: false,
+                        mergeStateStatus: "RESOLVED"
+                    };
                 }
 
-                // Load oursCommit root tree entries to compute differences for build_tree_from_changes
-                const oursCommitRecord = await tx.commit.findUnique({
-                    where: { commitHash: mergeState.oursCommit },
-                    select: { rootTree: true }
-                });
-                if (!oursCommitRecord) {
-                    throw new BadRequestError("Repository ours commit record not found");
+                const newOursCommit = currentRepo.headCommit;
+                const newTheirsCommit = currentWorkspace.head;
+                if (!newOursCommit || !newTheirsCommit) {
+                    throw new BadRequestError("Invalid branch heads");
                 }
 
-                const oursMap = await storageService.flatten_tree(oursCommitRecord.rootTree);
-                const oursBlobs: Record<string, string> = {};
-                for (const [path, info] of Object.entries(oursMap)) {
-                    if (info.type === "blob") {
-                        oursBlobs[path] = info.hash;
-                    }
+                const mergeBaseTrail = await storageService.mergeBase(newOursCommit, newTheirsCommit);
+                const newBaseCommit = mergeBaseTrail.length > 0 ? mergeBaseTrail[0] : null;
+                if (!newBaseCommit) {
+                    throw new BadRequestError("No common ancestor found");
                 }
 
-                // Compare oursBlobs and finalMergedMap to generate the changes array
-                const changes: BuildTreeChange[] = [];
+                const reEvaluation = await storageService.threeWayTreeMerge(newOursCommit, newTheirsCommit);
 
-                // ADDs and MODIFYs
-                for (const [path, newHash] of Object.entries(finalMergedMap)) {
-                    const oldHash = oursBlobs[path];
-                    if (!oldHash) {
-                        changes.push({
-                            filePath: path,
-                            action: "ADD",
-                            blobHash: newHash
-                        });
-                    } else if (oldHash !== newHash) {
-                        changes.push({
-                            filePath: path,
-                            action: "MODIFY",
-                            blobHash: newHash
-                        });
-                    }
-                }
-
-                // DELETEs
-                for (const path of Object.keys(oursBlobs)) {
-                    if (!finalMergedMap[path]) {
-                        changes.push({
-                            filePath: path,
-                            action: "DELETE",
-                            blobHash: null
-                        });
-                    }
-                }
-
-                // Build final root tree hash
-                const finalRootTreeHash = await storageService.build_tree_from_changes(
-                    { rootTree: oursCommitRecord.rootTree },
-                    changes,
-                    tx
-                );
-
-                // Create the Merge Commit
-                const committedAt = new Date();
-                const timestamp = Math.floor(committedAt.getTime() / 1000);
-                const COMMIT_TIMEZONE = "+0530";
-                const message = `Merge PR #${pr.id}: ${pr.title}`;
-
-                const authorIdentity = { name: req.user!.name, email: req.user!.email };
-
-                const newMergeCommitHash = hashCommit({
-                    rootTree: finalRootTreeHash,
-                    parents: [mergeState.oursCommit, mergeState.theirsCommit],
-                    author: authorIdentity,
-                    timestamp,
-                    timezone: COMMIT_TIMEZONE,
-                    message
-                });
-
-                // Insert the new Commit record
-                await tx.commit.create({
-                    data: {
-                        commitHash: newMergeCommitHash,
-                        rootTree: finalRootTreeHash,
-                        parent: mergeState.oursCommit,
-                        author: `${authorIdentity.name} <${authorIdentity.email}>`,
-                        timestamp: committedAt,
-                        message,
-                        parentWorkspaceId: null
-                    }
-                });
-
-                // Insert Commit Parents
-                await tx.commitParent.createMany({
-                    data: [
-                        { commitHash: newMergeCommitHash, parentHash: mergeState.oursCommit, ordinal: 0 },
-                        { commitHash: newMergeCommitHash, parentHash: mergeState.theirsCommit, ordinal: 1 }
-                    ]
-                });
-
-                // Advance repo HEAD with optimistic locking
-                const repoUpdate = await tx.repository.updateMany({
-                    where: { id: repoId, headCommit: mergeState.oursCommit },
-                    data: { headCommit: newMergeCommitHash }
-                });
-                if (repoUpdate.count === 0) {
-                    throw new BadRequestError("Concurrent modification: Repository HEAD advanced. Please abort and retry the merge.");
-                }
-
-                // Freeze snapshot onto PR and set status to MERGED
-                await tx.pullRequest.update({
-                    where: { id: prId },
-                    data: {
-                        status: "MERGED",
-                        baseCommit: mergeState.baseCommit,
-                        mergeCommit: newMergeCommitHash,
-                        updatedAt: new Date()
-                    }
-                });
-
-
-
-                // Update workspace status and head
-                const isWorkspaceFullyMerged = pr.workspace?.head === pr.prHead;
-                const workspaceDataToUpdate: any = {
-                    status: "CLEAN",
-                    updatedAt: new Date()
-                };
-                if (isWorkspaceFullyMerged) {
-                    workspaceDataToUpdate.head = newMergeCommitHash;
-                }
-
-                await tx.workspace.update({
-                    where: { id: pr.workspaceId! },
-                    data: workspaceDataToUpdate
-                });
-
-                // Update MergeState status to RESOLVED
                 await tx.mergeState.update({
                     where: { id: mergeState.id },
                     data: {
-                        status: "RESOLVED",
-                        mergedTree: finalRootTreeHash,
+                        oursCommit: newOursCommit,
+                        theirsCommit: newTheirsCommit,
+                        baseCommit: newBaseCommit,
+                        status: reEvaluation.conflicts.length === 0 ? "RESOLVED" : "IN_PROGRESS",
                         updatedAt: new Date()
                     }
                 });
 
-                return newMergeCommitHash;
-            });
-
-            // 3. Send notifications (outside transaction to prevent lock delays)
-            try {
-                await notificationService.notify({
-                    userId: pr.authorId,
-                    actorId: userId,
-                    type: "pr_merged",
-                    context: {
-                        actorName: req.user!.name,
-                        repoName: pr.repo.name,
-                        prTitle: pr.title
-                    },
-                    data: {
-                        repoId,
-                        prId: pr.id,
-                        mergeCommit: mergeCommitHash
-                    }
+                const existingConflicts = await tx.mergeConflict.findMany({
+                    where: { mergeStateId: mergeState.id }
                 });
-            } catch (notifyErr) {
-                // Log and swallow notification errors
-            }
 
-            res.status(200).json({
-                status: "success",
-                message: "Conflicts resolved and merge completed successfully.",
-                data: {
-                    mergeCommit: mergeCommitHash
+                const existingMap = new Map(existingConflicts.map(c => [c.filePath, c]));
+                const newConflictingPaths = new Set(reEvaluation.conflicts.map(c => c.filePath));
+
+                for (const c of reEvaluation.conflicts) {
+                    const existing = existingMap.get(c.filePath);
+                    if (existing) {
+                        const isIdentical = existing.conflictType === c.conflictType &&
+                            existing.baseBlob === c.baseBlob &&
+                            existing.oursBlob === c.oursBlob &&
+                            existing.theirsBlob === c.theirsBlob;
+
+                        if (!isIdentical) {
+                            await tx.mergeConflict.update({
+                                where: { id: existing.id },
+                                data: {
+                                    conflictType: c.conflictType,
+                                    baseBlob: c.baseBlob,
+                                    oursBlob: c.oursBlob,
+                                    theirsBlob: c.theirsBlob,
+                                    resolution: "PENDING",
+                                    resolvedBlob: null,
+                                    resolvedAt: null
+                                }
+                            });
+                        }
+                    } else {
+                        await tx.mergeConflict.create({
+                            data: {
+                                mergeStateId: mergeState.id,
+                                filePath: c.filePath,
+                                conflictType: c.conflictType,
+                                baseBlob: c.baseBlob,
+                                oursBlob: c.oursBlob,
+                                theirsBlob: c.theirsBlob,
+                                resolution: "PENDING"
+                            }
+                        });
+                    }
                 }
+
+                for (const existing of existingConflicts) {
+                    if (!newConflictingPaths.has(existing.filePath)) {
+                        await tx.mergeConflict.delete({
+                            where: { id: existing.id }
+                        });
+                    }
+                }
+
+                if (reEvaluation.conflicts.length === 0) {
+                    await tx.workspace.update({
+                        where: { id: pr.workspaceId! },
+                        data: { status: "CLEAN" }
+                    });
+                }
+
+                const updatedConflicts = await tx.mergeConflict.findMany({
+                    where: { mergeStateId: mergeState.id }
+                });
+
+                return {
+                    gitHistoryChanged: true,
+                    conflicts: updatedConflicts
+                };
             });
+
+            if (result.gitHistoryChanged) {
+                res.status(200).json({
+                    status: "success",
+                    message: "Git history has changed. Please update the given conflicts.",
+                    data: result
+                });
+            } else {
+                res.status(200).json({
+                    status: "success",
+                    message: result.mergeStateStatus === "RESOLVED"
+                        ? "All conflicts resolved successfully. Ready to merge."
+                        : "Resolutions saved successfully.",
+                    data: result
+                });
+            }
 
         } catch (err) {
             handleError("/api/pr/resolve-conflicts/:repoId/:prId", err, next);

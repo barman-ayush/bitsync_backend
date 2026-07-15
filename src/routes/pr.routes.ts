@@ -30,7 +30,7 @@ router.get("/mergeability/:repoId/:workspaceId/:prId", requireRepoAccess, author
 router.get("/assigned-reviews/:repoId", requireRepoAccess, authorize("repo:view"), PRController.fetchAssignedReviews);
 router.get("/review-view/:repoId/:workspaceId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getReviewerViewData);
 router.get("/reviews/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getPrReviews);
-router.post("/resolve-conflicts/:repoId/:prId", requireRepoAccess, authorize("repo:push"), PRController.resolveConflictsAndMerge);
+router.post("/resolve-conflicts/:repoId/:prId", requireRepoAccess, authorize("repo:push"), PRController.resolveConflicts);
 router.post("/add-reviewers/:repoId/:prId", requireRepoAccess, authorize("repo:push"), PRController.addReviewers);
 router.post("/submit-review/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.submitReview);
 router.get("/review-status/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getPrReviewStatus);

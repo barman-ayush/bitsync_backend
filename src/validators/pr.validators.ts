@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { ReviewVerdict } from "../generated/prisma/client";
+import { ReviewVerdict, ConflictResolution } from "../generated/prisma/client";
+
 
 export const prSchema = z.object({
     repoId: z.string().uuid(),
@@ -36,8 +37,9 @@ export const deleteCommentSchema = z.object({
 
 export const resolveConflictsSchema = z.object({
     resolutions: z.array(z.object({
-        filePath: z.string().min(1, "filePath is required"),
-        blobHash: z.string().nullable()
+        conflictId: z.string().uuid("Invalid conflictId"),
+        resolution: z.nativeEnum(ConflictResolution),
+        resolvedBlob: z.string().nullable().optional()
     })).min(1, "At least one resolution is required")
 });
 
