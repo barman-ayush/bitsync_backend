@@ -46,7 +46,6 @@ export class PRController {
 
             const { repoId, workspaceId } = parsed.data;
 
-            console.log("COMMIT TRAIL", repoId, workspaceId);
 
             const [repoHead, workspaceHead] = await Promise.all([
                 db.prisma.repository.findFirst({
@@ -175,14 +174,11 @@ export class PRController {
                 if (!reviewers || reviewers.length === 0) {
                     throw new BadRequestError("At least one reviewer is required bahencjhid.");
                 }
-                console.log("CREATE_PR")
 
                 const reviewerUsers = await db.prisma.user.findMany({
                     where: { email: { in: reviewers } }
                 });
                 const reviewerUserIds = reviewerUsers.map((u) => u.id);
-                console.log(reviewerUsers);
-                console.log(reviewerUserIds);
 
                 validReviewerUsers = await PRController.validateReviewersHelper(repoId, reviewerUserIds, userId);
             }
@@ -200,7 +196,6 @@ export class PRController {
             if (pendingChanges) throw new BadRequestError("Pending changes found in workspace, please commit them before creating a PR");
 
             const threeWayMergeResults = await storageService.threeWayTreeMerge(repositoryActive.headCommit, workspaceExists.head);
-            console.log("THREE_WAY_MERGE ", threeWayMergeResults);
 
             const hasConflicts = threeWayMergeResults.conflicts.length > 0;
 
@@ -232,7 +227,6 @@ export class PRController {
                 }
 
                 if (hasConflicts) {
-                    console.log("has conflicts : ", hasConflicts);
                     const mergeState = await tx.mergeState.create({
                         data: {
                             prId: pr.id,
@@ -244,7 +238,6 @@ export class PRController {
                             mergedTree: null
                         }
                     });
-                    console.log("Merge State", mergeState);
                     mergeStateId = mergeState.id;
 
                     if (threeWayMergeResults.conflicts.length > 0) {
@@ -259,7 +252,6 @@ export class PRController {
                                 resolution: "PENDING"
                             }))
                         });
-                        console.log("CONFLICTS ", conflicts);
                     }
 
                     await tx.workspace.update({
@@ -995,7 +987,6 @@ export class PRController {
         try {
             if (!req.user) throw new UnauthorizedError("Please Login");
             const userId = req.user.sub;
-            console.log("RESOLVE CONFLICT")
 
             const parsedParams = prDetailsSchema.safeParse(req.params);
             if (!parsedParams.success) throw new BadRequestError(parsedParams.error.issues[0].message);
@@ -1029,10 +1020,8 @@ export class PRController {
                     prId: pr.id
                 }
             })
-            console.log(ms);
 
             const mergeState = pr.mergeStates[0];
-            console.log("mergin pr ", pr);
             if (!mergeState) throw new BadRequestError("No active merge state found, Please close and open a new pull request");
 
             const result = await db.prisma.$transaction(async (tx) => {

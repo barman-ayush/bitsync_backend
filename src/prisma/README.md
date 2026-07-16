@@ -80,7 +80,6 @@ async function main() {
 
   // Use db.prisma for all queries — same client the app uses.
   const users = await db.prisma.user.findMany();
-  console.log(users);
 }
 
 main()
