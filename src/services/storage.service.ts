@@ -478,7 +478,6 @@ class StorageService {
             }
             trail.push(null);
             // trail.reverse() = [null, workspace_first_commit , ... , workspaceHead]
-            // LCA is null as mainline is empty, there is no LCA
             return trail.reverse();
         }
 
@@ -487,10 +486,8 @@ class StorageService {
         const visitedB = new Map<string, number>([[commitB, 0]]);
         let queueA: string[] = [commitA];
         let queueB: string[] = [commitB];
-        let commitTrail: string[] = [];
-        let isComplete = false;
         let lowestCommonAncestor: string | null = null;
-
+        let isComplete = false;
 
         while (queueA.length > 0 || queueB.length > 0) {
             // Expand one level from side A.
@@ -502,6 +499,7 @@ class StorageService {
                     for (const parent of parents) {
                         if (isComplete) break;
                         if (visitedB.has(parent)) {
+                            lowestCommonAncestor = parent;
                             isComplete = true;
                             break;
                         }
@@ -523,8 +521,6 @@ class StorageService {
                     for (const parent of parents) {
                         if (isComplete) break;
                         if (visitedA.has(parent)) {
-                            // the lca is found and laready visited;
-                            commitTrail.push(parent);
                             lowestCommonAncestor = parent;
                             isComplete = true;
                             break;
@@ -532,7 +528,6 @@ class StorageService {
                         if (!visitedB.has(parent)) {
                             visitedB.set(parent, visitedB.get(current)! + 1);
                             nextB.push(parent);
-                            commitTrail.push(parent);
                         }
                     }
                 }
@@ -540,18 +535,24 @@ class StorageService {
             }
             if (isComplete) break;
         }
-        // expected structure : 
-        // [ lowestCommonAncestor, .... , workspaceHead ]
-        let finalCommitTrail: string[] = [];
-        if (lowestCommonAncestor) {
-            for (const commit of commitTrail) {
-                finalCommitTrail.push(commit);
-                if (commit == lowestCommonAncestor) break;
-            }
+
+        if (!lowestCommonAncestor) {
+            return [];
         }
 
-        return finalCommitTrail;
+        // Reconstruct the path from lowestCommonAncestor to commitB (workspaceHead)
+        let current = commitB;
+        const trail: string[] = [current];
+        while (current !== lowestCommonAncestor) {
+            const parents = await this.getAllParents(current);
+            if (parents.length === 0) break;
+            current = parents[0];
+            trail.push(current);
+        }
 
+        // trail is currently [commitB, ..., lowestCommonAncestor]
+        // Reverse it to get [lowestCommonAncestor, ..., commitB]
+        return trail.reverse();
     }
 
     // isAncestorOf : check if `ancestor` is reachable by walking back from
