@@ -2,7 +2,7 @@ import { NextFunction, Request, Response } from "express";
 import { ConflictResolution } from "../generated/prisma/client";
 import { handleError } from "../middlewares/error.middleware";
 import { BadRequestError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors/app.error";
-import { createPullRequestSchema, prSchema, listPrQuerySchema, prDetailsSchema, createCommentSchema, deleteCommentSchema, resolveConflictsSchema, prMergeabilitySchema, listAssignedReviewsSchema, listAssignedReviewsQuerySchema, reviewerPrViewSchema, addReviewersSchema, submitReviewSchema, prReviewStatusSchema } from "../validators/pr.validators";
+import { createPullRequestSchema, prSchema, listPrQuerySchema, prDetailsSchema, createCommentSchema, deleteCommentSchema, resolveConflictsSchema, prMergeabilitySchema, listAssignedReviewsSchema, listAssignedReviewsQuerySchema, reviewerPrViewSchema, addReviewersSchema, submitReviewSchema, prReviewStatusSchema, prIdentifierSchema } from "../validators/pr.validators";
 import { hashCommit } from "../utils/blob.utils";
 import db from "../services/database.service";
 import storageService from "../services/storage.service";
@@ -41,10 +41,10 @@ export class PRController {
         try {
             if (!req.user) throw new UnauthorizedError("Unauthorized");
 
-            const parsed = prSchema.safeParse(req.params);
+            const parsed = prIdentifierSchema.safeParse(req.params);
             if (!parsed.success) throw new BadRequestError(parsed.error.issues[0].message);
 
-            const { repoId, workspaceId } = parsed.data;
+            const { repoId, workspaceId, prId } = parsed.data;
 
 
             const [repoHead, workspaceHead] = await Promise.all([
@@ -61,28 +61,21 @@ export class PRController {
             if (!repoHead) throw new NotFoundError("No Repository found");
             if (!workspaceHead) throw new NotFoundError("No such Workspace found");
 
-            const pr = await db.prisma.pullRequest.findFirst({
-                where: { workspaceId, repoId },
-                orderBy: { createdAt: "desc" }
-            });
+            // NOTE : No need to check for pr = null
+            // No PR case is for draft PR commit trail checks.
+            // that is why this endpoint has optional prId
+            const pr = prId
+                ? await db.prisma.pullRequest.findFirst({
+                    where: { workspaceId, repoId, id: prId },
+                })
+                : null;
 
             let workspaceCommitTrail: (string | null)[] = [];
-
-            if (pr && pr.status === "MERGED" && workspaceHead.head === pr.prHead) {
+            if (pr && pr.status === "MERGED") {
                 workspaceCommitTrail = await storageService.mergeBase(pr.baseCommit, pr.prHead);
-            } else if (!repoHead.headCommit) {
-                const commitTrail = await db.prisma.commit.findMany({
-                    where: {
-                        parentWorkspaceId: workspaceId
-                    },
-                    select: {
-                        message: true, commitHash: true, timestamp: true
-                    }
-                });
-                const sortedCommits = commitTrail.sort(
-                    (a, b) => a.timestamp.getTime() - b.timestamp.getTime()
-                );
-
+            } else if (pr && !repoHead.headCommit) {
+                // Empty Repository , nothing merged yet.
+                const sortedCommits = await storageService.getSortedCommitsUnderWorkspace(workspaceId);
                 res.status(200).json({
                     status: "success",
                     data: sortedCommits
@@ -97,7 +90,7 @@ export class PRController {
             const commitsToFetch = workspaceCommitTrail.slice(1).filter((c): c is string => c !== null);
 
             if (commitsToFetch.length === 0) {
-                throw new BadRequestError("No commit trail found !");
+                throw new BadRequestError("No new commits to create a Pull Request");
             }
 
             const commitDetails = await db.prisma.commit.findMany({

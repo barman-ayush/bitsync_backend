@@ -1226,6 +1226,20 @@ class StorageService {
         // Fallback — should be unreachable.
         return { type: "RESOLVED", hash: baseHash };
     }
+
+    public async getSortedCommitsUnderWorkspace(workspaceId: string) {
+        const commitTrail = await db.prisma.commit.findMany({
+            where: {
+                parentWorkspaceId: workspaceId
+            },
+            select: {
+                message: true, commitHash: true, timestamp: true
+            }
+        });
+        return commitTrail.sort(
+            (a, b) => a.timestamp.getTime() - b.timestamp.getTime()
+        );
+    }
 }
 const storageService = StorageService.getInstance();
 

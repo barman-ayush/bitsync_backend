@@ -8,8 +8,9 @@ const router = Router();
 router.use(authMiddleware);
 
 // Returns the list of commits that are present in the workspace but not in the main repo.
-// Used for checking the commit trail of a PR.
-router.get("/commit-trail/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), PRController.fetchPrCommits);
+// Used for checking the commit trail of a PR. Supports both active workspace checks and historical PR checks.
+// NOTE : prId is optional to handle the draft PR commit trail case also.
+router.get("/commit-trail/:repoId/:workspaceId{/:prId}", requireRepoAccess, authorize("repo:view"), PRController.fetchPrCommits);
 
 // Fetches the status ->  [ "CREATE_PR", "VIEW_PR" ]
 // Used for checking whether we can create a PR or not.

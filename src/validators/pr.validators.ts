@@ -7,6 +7,12 @@ export const prSchema = z.object({
     workspaceId: z.string().uuid(),
 });
 
+export const prIdentifierSchema = z.object({
+    repoId: z.string().uuid(),
+    workspaceId: z.string().uuid(),
+    prId: z.string().uuid().optional()
+});
+
 export const createPullRequestSchema = z.object({
     title: z.string().min(1, "Title is required"),
     description: z.string().min(1, "Description is required"),
