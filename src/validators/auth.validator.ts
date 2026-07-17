@@ -53,3 +53,17 @@ export const loginSchema = z.object({
 
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type LoginInput = z.infer<typeof loginSchema>;
+
+export const updateUserProfileSchema = z.object({
+    newDisplayName: z
+        .string()
+        .min(1, "Display name cannot be empty.")
+        .max(100, "Display name must be at most 100 characters.")
+        .optional(),
+    avatarBlob: z
+        .string()
+        .min(1, "Avatar blob string cannot be empty.")
+        .optional()
+}).refine(data => data.newDisplayName !== undefined || data.avatarBlob !== undefined, {
+    message: "At least one of newDisplayName or avatarBlob is required."
+});

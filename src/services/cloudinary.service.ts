@@ -84,6 +84,33 @@ class CloudinaryService {
         });
         return { url, expiresAt };
     }
+
+    // uploadAvatar : upload a public profile image for a user under bitsync/avatars/<userId>
+    public async uploadAvatar(content: Buffer, userId: string): Promise<string> {
+        return new Promise<string>((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+                {
+                    resource_type: "image",
+                    type: "upload", // public delivery
+                    folder: "bitsync/avatars",
+                    public_id: userId,
+                    overwrite: true,
+                    invalidate: true
+                },
+                (error, result) => {
+                    if (error) {
+                        logger.error("CLOUDINARY", `Avatar upload failed for user ${userId}: ${error.message}`);
+                        return reject(error);
+                    }
+                    if (!result) {
+                        return reject(new Error("Cloudinary upload returned empty result"));
+                    }
+                    resolve(result.secure_url);
+                }
+            );
+            stream.end(content);
+        });
+    }
 }
 
 const cloudinaryService = CloudinaryService.getInstance();

@@ -9,6 +9,7 @@ router.get("/check-username/:username", UserDataController.checkUsernameAvailabi
 router.get("/data" , authMiddleware , UserDataController.getUser);
 router.get("/search/:username", authMiddleware, UserDataController.fetchUserByUsername);
 router.get("/search/repo/:username/:repoId", authMiddleware, UserDataController.fetchRepositoryNonMemberUsers);
-
+router.patch("/update", authMiddleware, UserDataController.updateUserProfile);
+router.get("/:username", authMiddleware, UserDataController.getUserProfile);
 
 export default router;  
