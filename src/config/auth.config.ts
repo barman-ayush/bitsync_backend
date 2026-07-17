@@ -7,9 +7,11 @@ export const CONCURRENT_REFRESH_GRACE_MS = 10 * 1000; // 10 seconds
 
 export const SALT_ROUNDS = 10;
 
+const isProduction = process.env.NODE_ENV === "production" || !process.env.CLIENT_URL?.includes("localhost");
+
 export const AUTH_COOKIE_OPTIONS: CookieOptions = {
     httpOnly: true,
-    secure: true,
-    sameSite: "strict",
+    secure: isProduction,
+    sameSite: isProduction ? "none" : "lax",
     path: "/",
 };
