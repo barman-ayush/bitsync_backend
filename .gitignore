@@ -4,4 +4,5 @@
 
 /src/generated/prisma
 .env
+.env.prod
 /dist
