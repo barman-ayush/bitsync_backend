@@ -28,15 +28,15 @@ router.get("/list/:repoId", requireRepoAccess, authorize("repo:view"), PRControl
 // fetches a single PR
 router.get("/details/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getPrDetails);
 
-// Returns the diff of the PR
+// Returns the commit changes of workspace 
+// Contains only the commits after the latest merge
 router.get("/commit-changes/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), PRController.getPrCommitChanges);
-
-// Returns the merge check result
-// router.get("/merge-check/:repoId/:workspaceId", requireRepoAccess, authorize("repo:view"), PRController.getMergeCheck);
 
 router.post("/close/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.closePR);
 router.get("/assigned-reviews/:repoId", requireRepoAccess, authorize("repo:view"), PRController.fetchAssignedReviews);
+// Fetches request review changes 
 router.get("/review-view/:repoId/:workspaceId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getReviewerViewData);
+// Fetched existing PR changes
 router.get("/changes-view/:repoId/:workspaceId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getChangesWithConflicts);
 router.get("/reviews/:repoId/:prId", requireRepoAccess, authorize("repo:view"), PRController.getPrReviews);
 router.post("/resolve-conflicts/:repoId/:prId", requireRepoAccess, authorize("repo:push"), PRController.resolveConflicts);

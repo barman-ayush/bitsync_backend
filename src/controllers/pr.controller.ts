@@ -1889,23 +1889,66 @@ export class PRController {
                 throw new NotFoundError("Workspace or Repository not found");
             }
 
-            if (mergeState) {
-                const isUpToDate = (currentWorkspace.head === mergeState.theirsCommit) &&
-                    (currentRepo.headCommit === mergeState.oursCommit);
+            if (pr.status === "OPEN") {
+                if (mergeState) {
+                    const isUpToDate = (currentWorkspace.head === mergeState.theirsCommit) &&
+                        (currentRepo.headCommit === mergeState.oursCommit);
 
-                if (!isUpToDate) {
-                    const newOursCommit = currentRepo.headCommit;
-                    const newTheirsCommit = currentWorkspace.head;
-                    if (newOursCommit && newTheirsCommit) {
-                        await db.prisma.$transaction(async (tx) => {
-                            await PRController.reEvaluateConflictsHelper(
-                                tx,
-                                pr,
-                                mergeState,
-                                newOursCommit,
-                                newTheirsCommit
-                            );
-                        });
+                    if (!isUpToDate) {
+                        const newOursCommit = currentRepo.headCommit;
+                        const newTheirsCommit = currentWorkspace.head;
+                        if (newOursCommit && newTheirsCommit) {
+                            await db.prisma.$transaction(async (tx) => {
+                                await PRController.reEvaluateConflictsHelper(
+                                    tx,
+                                    pr,
+                                    mergeState,
+                                    newOursCommit,
+                                    newTheirsCommit
+                                );
+                            });
+                        }
+                    }
+                } else {
+                    if (currentWorkspace.head) {
+                        const mergeResult = await storageService.threeWayTreeMerge(
+                            currentRepo.headCommit,
+                            currentWorkspace.head
+                        );
+                        if (mergeResult.conflicts.length > 0) {
+                            mergeState = await db.prisma.$transaction(async (tx) => {
+                                const newMergeState = await tx.mergeState.create({
+                                    data: {
+                                        prId: pr.id,
+                                        workspaceId: workspaceId,
+                                        baseCommit: mergeResult.baseCommit ?? "",
+                                        oursCommit: currentRepo.headCommit ?? "",
+                                        theirsCommit: currentWorkspace.head!,
+                                        status: "IN_PROGRESS",
+                                        mergedTree: null
+                                    }
+                                });
+
+                                await tx.mergeConflict.createMany({
+                                    data: mergeResult.conflicts.map((c) => ({
+                                        mergeStateId: newMergeState.id,
+                                        filePath: c.filePath,
+                                        conflictType: c.conflictType,
+                                        baseBlob: c.baseBlob,
+                                        oursBlob: c.oursBlob,
+                                        theirsBlob: c.theirsBlob,
+                                        resolution: "PENDING"
+                                    }))
+                                });
+
+                                await tx.workspace.update({
+                                    where: { id: workspaceId },
+                                    data: { status: "CONFLICTED" }
+                                });
+
+                                return newMergeState;
+                            });
+                        }
                     }
                 }
             }
@@ -1916,8 +1959,13 @@ export class PRController {
                 })
                 : [];
 
-            const repoHead = currentRepo.headCommit;
-            const workspaceHead = currentWorkspace.head;
+            let repoHead = currentRepo.headCommit;
+            let workspaceHead = currentWorkspace.head;
+
+            if (pr.status === "MERGED" || pr.status === "CLOSED") {
+                repoHead = pr.baseCommit || currentRepo.headCommit;
+                workspaceHead = pr.prHead;
+            }
 
             if (!workspaceHead) {
                 throw new BadRequestError("Workspace has no head commit");
