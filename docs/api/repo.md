@@ -5,7 +5,7 @@ Controller: `src/controllers/repo.controllers.ts`.
 Validators: `src/validators/repo.validator.ts`.
 
 All routes in this category require authentication (`authMiddleware` is applied router-wide).
-Routes that operate on a specific repository additionally pass through `repoContext` and `authorize(<permission>)`.
+Routes that operate on a specific repository additionally pass through `repoContext` (or `resolveRepoBySlug`) and `authorize(<permission>)`.
 
 For shared conventions and the full permission matrix, see [conventions.md](./conventions.md).
 
@@ -13,7 +13,7 @@ For shared conventions and the full permission matrix, see [conventions.md](./co
 
 ## `GET /api/repo/`
 
-Search and list repositories the caller is a member of. Supports filtering, sorting, and pagination.
+Search and list repositories the caller is an active member of. Supports filtering, sorting, and pagination.
 
 **Auth:** required.
 
@@ -51,7 +51,7 @@ Search and list repositories the caller is a member of. Supports filtering, sort
           "usernameNormalized": "ayush",
           "avatarUrl": null
         },
-        "headCommit": null,
+        "headCommit": "commit-hash",
         "createdAt": "2026-05-28T10:00:00.000Z",
         "updatedAt": "2026-05-28T10:00:00.000Z",
         "role": "owner"
@@ -73,7 +73,7 @@ Search and list repositories the caller is a member of. Supports filtering, sort
 
 ## `GET /api/repo/check-name/:repoName`
 
-Check whether a repo name is available for the **currently authenticated owner**. (Names are unique per owner, not globally.)
+Check whether a repo name is available for the **currently authenticated user** (Names are unique per owner/creator, not globally).
 
 **Auth:** required.
 
@@ -105,7 +105,7 @@ Check whether a repo name is available for the **currently authenticated owner**
 
 ## `POST /api/repo/create`
 
-Create a new repository. The caller is automatically added as the **owner**. An optional list of users can be added as initial members with `member` or `admin` role.
+Create a new repository. The caller is automatically added as the `owner`. An optional list of email addresses can be provided to invite initial contributors as admins or members.
 
 **Auth:** required.
 
@@ -116,8 +116,8 @@ Create a new repository. The caller is automatically added as the **owner**. An 
   "name": "bitsync",
   "description": "Optional description",
   "users": [
-    { "userId": "uuid", "role": "member" },
-    { "userId": "uuid", "role": "admin" }
+    { "email": "contributor1@example.com", "role": "member" },
+    { "email": "contributor2@example.com", "role": "admin" }
   ]
 }
 ```
@@ -126,7 +126,7 @@ Create a new repository. The caller is automatically added as the **owner**. An 
 | --- | --- |
 | `name` | Required. 1–255 chars, valid repo-name charset. |
 | `description` | Optional, ≤ 10000 chars. |
-| `users` | Optional array of `{ userId, role }`. `role` must be `member` or `admin` (owner is reserved for the creator). Duplicates are silently skipped. |
+| `users` | Optional array of `{ email, role }`. `role` must be `member` or `admin`. Maximum of 50 users. |
 
 ### Responses
 
@@ -144,7 +144,14 @@ Create a new repository. The caller is automatically added as the **owner**. An 
     "headCommit": null,
     "createdAt": "2026-05-28T10:00:00.000Z",
     "updatedAt": "2026-05-28T10:00:00.000Z",
-    "role": "owner"
+    "role": "owner",
+    "invites": {
+      "invited": 2,
+      "updated": 0,
+      "skipped": 0,
+      "notFound": [],
+      "alreadyMember": []
+    }
   }
 }
 ```
@@ -156,13 +163,342 @@ Create a new repository. The caller is automatically added as the **owner**. An 
 
 ---
 
-## `GET /api/repo/:repoId`
+## `POST /api/repo/invite/accept`
 
-Fetch a single repository the caller has access to. Includes the caller's role in the response.
+Accept a repository invitation. The corresponding notification is consumed (deleted).
 
-**Auth + middleware chain:** `authMiddleware → repoContext → authorize("repo:view")`.
+**Auth:** required.
 
-**Permission:** `repo:view` — `owner`, `admin`, or `member`.
+### Request body
+
+```json
+{
+  "notificationId": "uuid"
+}
+```
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "message": "You joined bitsync as member."
+}
+```
+
+**Errors**
+- `400 BadRequest` — `"This invitation has expired. Ask for a new invite."`
+- `401 Unauthorized` — not authenticated.
+- `404 NotFound` — `"Invitation not found."` or `"repository no longer exists."`
+
+---
+
+## `POST /api/repo/invite/decline`
+
+Decline (decline) a repository invitation. The corresponding notification is consumed (deleted).
+
+**Auth:** required.
+
+### Request body
+
+```json
+{
+  "notificationId": "uuid"
+}
+```
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "message": "Invitation to bitsync declined."
+}
+```
+
+**Errors**
+- `401 Unauthorized` — not authenticated.
+- `404 NotFound` — `"Invitation not found."`
+
+---
+
+## `GET /api/repo/:repoId/contributors`
+
+Fetch a list of all active contributors (members/admins/owner) of a repository.
+
+**Auth + middleware chain:** `authMiddleware → requireRepoAccess → authorize("repo:view")`.
+
+### Path parameters
+
+| Param | Rules |
+| --- | --- |
+| `repoId` | Valid UUID. |
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "data": [
+    {
+      "role": "owner",
+      "joinedAt": "2026-05-28T10:00:00.000Z",
+      "user": {
+        "id": "uuid",
+        "displayName": "Ayush Barman",
+        "username": "ayush",
+        "email": "ayush@example.com",
+        "avatarUrl": null
+      }
+    }
+  ]
+}
+```
+
+**Errors**
+- `401 Unauthorized` — not authenticated.
+- `404 NotFound` — repository not found / caller not a member.
+
+---
+
+## `GET /api/repo/:repoId/reviewers/search`
+
+Search active members of the repository to assign as reviewers (excluding the current user).
+
+**Auth + middleware chain:** `authMiddleware → requireRepoAccess → authorize("repo:view")`.
+
+### Path parameters
+
+| Param | Rules |
+| --- | --- |
+| `repoId` | Valid UUID. |
+
+### Query parameters
+
+| Param | Type | Rules | Description |
+| --- | --- | --- | --- |
+| `q` | string | Optional | Text search by displayName, email, or username. |
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "data": [
+    {
+      "id": "uuid",
+      "displayName": "Reviewer User",
+      "username": "reviewer",
+      "email": "reviewer@example.com",
+      "avatarUrl": "https://res.cloudinary.com/...",
+      "role": "member"
+    }
+  ]
+}
+```
+
+---
+
+## `POST /api/repo/:repoId/invite`
+
+Invite a batch of users (by email) to join the repository. Owners can invite users as `admin` or `member`; Admins can only invite users as `member`.
+
+**Auth + middleware chain:** `authMiddleware → requireRepoAccess → authorize("member:invite")`.
+
+### Request body
+
+```json
+[
+  { "email": "user1@example.com", "role": "member" },
+  { "email": "user2@example.com", "role": "admin" }
+]
+```
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "message": "Invitations processed.",
+  "data": {
+    "invited": 2,
+    "updated": 0,
+    "skipped": 0,
+    "notFound": [],
+    "alreadyMember": []
+  }
+}
+```
+
+---
+
+## `POST /api/repo/:repoId/leave`
+
+Leave the repository. The active member removes themselves. The repository owner **cannot** leave the repository (must transfer ownership or delete repository instead).
+
+**Auth + middleware chain:** `authMiddleware → requireRepoAccess`.
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "message": "You left the repository."
+}
+```
+
+**Errors**
+- `403 Forbidden` — `"Owner cannot leave the repository. Transfer ownership or delete it instead."`
+
+---
+
+## `POST /api/repo/:repoId/remove`
+
+Remove a member from the repository (soft delete on membership).
+- Cannot remove yourself.
+- Cannot remove the owner.
+- Admins cannot remove other admins (only owners can).
+
+**Auth + middleware chain:** `authMiddleware → requireRepoAccess → authorize("member:remove")`.
+
+### Request body
+
+```json
+{
+  "userId": "uuid"
+}
+```
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "message": "User removed from the repository."
+}
+```
+
+---
+
+## `POST /api/repo/:repoId/promote`
+
+Promote a `member` to `admin`.
+
+**Auth + middleware chain:** `authMiddleware → requireRepoAccess → authorize("member:promote")`.
+
+### Request body
+
+```json
+{
+  "userId": "uuid"
+}
+```
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "message": "User promoted to admin."
+}
+```
+
+**Errors**
+- `409 Conflict` — `"User is already an admin."`
+
+---
+
+## `POST /api/repo/:repoId/demote`
+
+Demote an `admin` to `member`. **Owner-only operation.**
+
+**Auth + middleware chain:** `authMiddleware → requireRepoAccess → authorize("member:demote")`.
+
+### Request body
+
+```json
+{
+  "userId": "uuid"
+}
+```
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "message": "User demoted to member."
+}
+```
+
+**Errors**
+- `409 Conflict` — `"User is already a member."`
+
+---
+
+## `GET /api/repo/get-data/:repoId`
+
+Fetch files and directories representing the repository's main line HEAD state.
+
+**Auth + middleware chain:** `authMiddleware → requireRepoAccess → authorize("repo:view")`.
+
+### Query parameters
+
+| Param | Type | Description |
+| --- | --- | --- |
+| `treeHash` | string | Optional. Tree hash of a sub-directory to list. If omitted, lists the HEAD commit's root tree directory. |
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "message": "Repository data fetched successfully.",
+  "data": {
+    "tree": [
+      {
+        "name": "src",
+        "type": "tree",
+        "objectHash": "tree-hash-uuid"
+      },
+      {
+        "name": "package.json",
+        "type": "blob",
+        "objectHash": "blob-hash-sha",
+        "size": 1434
+      }
+    ]
+  }
+}
+```
+
+---
+
+## `GET /api/repo/:username/:reponame`
+
+Page-mount entry point to resolve and fetch repository metadata by owner username and repository name slug.
+
+**Auth + middleware chain:** `authMiddleware → resolveRepoBySlug → authorize("repo:view")`.
 
 ### Responses
 
@@ -176,237 +512,10 @@ Fetch a single repository the caller has access to. Includes the caller's role i
     "name": "bitsync",
     "description": "Optional description",
     "ownerId": "uuid",
-    "headCommit": null,
+    "headCommit": "commit-hash",
     "createdAt": "2026-05-28T10:00:00.000Z",
     "updatedAt": "2026-05-28T10:00:00.000Z",
     "role": "owner"
   }
 }
 ```
-
-**Errors**
-- `401 Unauthorized` — not authenticated.
-- `404 NotFound` — repo does not exist **or** caller is not a member.
-
----
-
-## `PUT /api/repo/:repoId`
-
-Update a repository's name and/or description.
-
-**Auth + middleware chain:** `authMiddleware → repoContext → authorize("repo:settings")`.
-
-**Permission:** `repo:settings` — `owner` or `admin`.
-
-### Request body
-
-```json
-{
-  "name": "new-name",
-  "description": "Updated description"
-}
-```
-
-| Field | Rules |
-| --- | --- |
-| `name` | Required. Same rules as create. |
-| `description` | Optional. `null` to clear, string ≤ 10000 chars to set. |
-
-### Responses
-
-**`200 OK`**
-
-```json
-{
-  "status": "success",
-  "message": "Repository updated.",
-  "data": {
-    "id": "uuid",
-    "name": "new-name",
-    "description": "Updated description",
-    "ownerId": "uuid",
-    "headCommit": null,
-    "createdAt": "2026-05-28T10:00:00.000Z",
-    "updatedAt": "2026-05-28T10:00:00.000Z",
-    "role": "owner"
-  }
-}
-```
-
-**Errors**
-- `400 BadRequest` — validation failure.
-- `403 Forbidden` — `"Insufficient permissions"` (caller is a member, not owner/admin).
-- `404 NotFound` — repo not found / caller not a member.
-- `409 Conflict` — `"You already have a repository with this name."`
-
----
-
-## `POST /api/repo/user/invite/:repoId`
-
-Invite a user to join the repository. The invitee receives an email and an in-app invitation. Admins can only invite as `member`; owners can invite as `admin` or `member`.
-
-**Auth + middleware chain:** `authMiddleware → repoContext → authorize("repo:settings")`.
-
-**Permission:** `repo:settings` — `owner` or `admin` (with extra in-controller checks for admin invites).
-
-### Request body
-
-```json
-{
-  "invitee_user_id": "uuid",
-  "invitee_user_role": "member"
-}
-```
-
-| Field | Rules |
-| --- | --- |
-| `invitee_user_id` | Required UUID of the user being invited. Cannot equal the caller. |
-| `invitee_user_role` | Required. `"admin"` or `"member"`. |
-
-### Responses
-
-**`201 Created`**
-
-```json
-{
-  "status": "success",
-  "message": "Invitation sent.",
-  "data": {
-    "id": "uuid",
-    "repoId": "uuid",
-    "inviteeId": "uuid",
-    "inviteeEmail": "user@example.com",
-    "role": "member",
-    "expiresAt": "2026-06-04T10:00:00.000Z",
-    "createdAt": "2026-05-28T10:00:00.000Z"
-  }
-}
-```
-
-**Errors**
-- `400 BadRequest` — validation failure.
-- `403 Forbidden` — `"User cannot be self-invited"` / `"Insufficient permissions"` / `"Admins can only invite members."`
-- `404 NotFound` — repo or invitee not found.
-- `409 Conflict` — `"User is already a member of this repository."` / `"A pending invitation already exists for this user."`
-
-> Note: there is exactly one invitation per `(repo, invitee)`. Expired invitations are hard-deleted and replaced by the new one within the same transaction.
-
----
-
-## `POST /api/repo/user/remove/:repoId`
-
-Remove a member from the repository (soft delete on `RepoMember`). Also deletes any pending invitations involving that user for this repo.
-
-**Auth + middleware chain:** `authMiddleware → repoContext → authorize("member:remove")`.
-
-**Permission:** `member:remove` — `owner` or `admin`. Additional in-controller rules:
-- Cannot remove yourself (use a leave-repo flow instead).
-- Cannot remove the owner.
-- Admins cannot remove other admins (only owners can).
-
-### Request body
-
-```json
-{
-  "invitee_user_id": "uuid",
-  "invitee_user_role": "member"
-}
-```
-
-> The schema requires `invitee_user_role` to be present, but the controller does not act on it for this endpoint.
-
-### Responses
-
-**`200 OK`**
-
-```json
-{ "status": "success", "message": "Member removed." }
-```
-
-**Errors**
-- `400 BadRequest` — `"Use leave repository instead."` if `invitee_user_id` equals the caller.
-- `403 Forbidden` — `"Owner cannot be removed."` / `"Admins can only remove members."` / `"Insufficient permissions"`.
-- `404 NotFound` — repo or target member not found.
-
----
-
-## `POST /api/repo/user/promote/:repoId`
-
-Promote a `member` to `admin`. Idempotent: if the target is already an admin, returns `200` with a no-op message.
-
-**Auth + middleware chain:** `authMiddleware → repoContext → authorize("member:promote")`.
-
-**Permission:** `member:promote` — `owner` or `admin`. Additional rules:
-- Cannot change your own role.
-- Cannot promote the owner.
-
-### Request body
-
-```json
-{
-  "invitee_user_id": "uuid",
-  "invitee_user_role": "admin"
-}
-```
-
-### Responses
-
-**`200 OK` (promoted)**
-
-```json
-{
-  "status": "success",
-  "message": "Member promoted to admin.",
-  "data": { "invitee_user_id": "uuid", "role": "admin" }
-}
-```
-
-**`200 OK` (already admin)**
-
-```json
-{ "status": "success", "message": "User already an admin." }
-```
-
-**Errors**
-- `400 BadRequest` — `"Cannot change your own role."` / `"Cannot promote owners."`
-- `403 Forbidden` — `"Insufficient permissions"`.
-- `404 NotFound` — repo or target member not found.
-
----
-
-## `POST /api/repo/user/demote/:repoId`
-
-Demote an `admin` to `member`. **Owner-only operation.** Also rewrites any pending `admin` invitations from that user to `member`, and deletes invitations that user had sent for this repo.
-
-**Auth + middleware chain:** `authMiddleware → repoContext → authorize("member:demote")`.
-
-**Permission:** `member:demote` — `owner` only. Additional rules:
-- Cannot change your own role.
-- Cannot demote the owner.
-- Cannot demote a `member` (already lowest role).
-
-### Request body
-
-```json
-{
-  "invitee_user_id": "uuid",
-  "invitee_user_role": "member"
-}
-```
-
-### Responses
-
-**`200 OK`**
-
-```json
-{
-  "status": "success",
-  "message": "Admin demoted to member.",
-  "data": { "invitee_user_id": "uuid", "role": "member" }
-}
-```
-
-**Errors**
-- `400 BadRequest` — `"Cannot change your own role."` / `"Members cannot be demoted any further."`
-- `403 Forbidden` — `"Only owners can demote admins."` / `"Owners cannot be demoted."` / `"Insufficient permissions"`.
-- `404 NotFound` — repo or target member not found.

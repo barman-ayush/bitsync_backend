@@ -2,6 +2,7 @@
 
 Routes mounted under `/api/user` (see `src/routes/user.routes.ts`).
 Controller: `src/controllers/user.controller.ts`.
+Validators: `src/validators/auth.validator.ts`.
 
 For shared conventions, see [conventions.md](./conventions.md).
 
@@ -108,7 +109,7 @@ Fuzzy-search users whose normalized username **contains** the given substring. E
 
 Search users by username **excluding** anyone who is already a member of the given repository. Useful for the "invite user" picker.
 
-**Auth:** required (`authMiddleware`). The caller must also be a member of the target repository.
+**Auth:** required (`authMiddleware`). The caller must also be an active member of the target repository.
 
 ### Path parameters
 
@@ -137,3 +138,100 @@ Search users by username **excluding** anyone who is already a member of the giv
 **Errors**
 - `400 BadRequest` — validation failure.
 - `401 Unauthorized` — not authenticated, **or** the caller is not a member of the repo: `"You are not authorised to search for this repository."`
+
+---
+
+## `PATCH /api/user/update`
+
+Update the authenticated user's profile display name and/or avatar. The avatar is uploaded to Cloudinary, and its URL is saved.
+
+**Auth:** required (`authMiddleware`).
+
+### Request body
+
+```json
+{
+  "newDisplayName": "Ayush New Name",
+  "avatarBlob": "data:image/png;base64,iVBORw0KGgoAAAAN..."
+}
+```
+
+| Field | Rules |
+| --- | --- |
+| `newDisplayName` | Optional. String (1–100 chars). |
+| `avatarBlob` | Optional. Base64 Data URL (e.g. `data:image/png;base64,...`) or raw base64 string. |
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "data": {
+    "id": "uuid",
+    "email": "user@example.com",
+    "username": "ayush",
+    "displayName": "Ayush New Name",
+    "avatarUrl": "https://res.cloudinary.com/demo/image/upload/v12345/avatars/uuid.png",
+    "emailVerified": true,
+    "createdAt": "2026-05-28T10:00:00.000Z",
+    "updatedAt": "2026-05-28T10:05:00.000Z"
+  }
+}
+```
+
+**Errors**
+- `400 BadRequest` — validation failure, or invalid base64 image data.
+- `401 Unauthorized` — not authenticated.
+
+---
+
+## `GET /api/user/:username`
+
+Fetch a user's profile by their username. Also lists matching repositories:
+- If fetching your own username, lists all repositories you are an active member of.
+- If fetching someone else's username, lists only common repositories that both of you are active members of.
+
+**Auth:** required (`authMiddleware`).
+
+### Path parameters
+
+| Param | Rules |
+| --- | --- |
+| `username` | Standard username schema. |
+
+### Responses
+
+**`200 OK`**
+
+```json
+{
+  "status": "success",
+  "data": {
+    "user": {
+      "id": "uuid",
+      "email": "user@example.com",
+      "displayName": "Ayush Barman",
+      "avatarUrl": "https://res.cloudinary.com/...",
+      "username": "ayush"
+    },
+    "repositories": [
+      {
+        "id": "uuid",
+        "name": "bitsync",
+        "description": "Repository description",
+        "ownerId": "owner-uuid",
+        "headCommit": "head-commit-hash",
+        "createdAt": "2026-05-28T10:00:00.000Z",
+        "updatedAt": "2026-05-28T10:00:00.000Z"
+      }
+    ]
+  }
+}
+```
+
+**Errors**
+- `400 BadRequest` — validation failure.
+- `401 Unauthorized` — not authenticated.
+- `404 NotFound` — user not found.
