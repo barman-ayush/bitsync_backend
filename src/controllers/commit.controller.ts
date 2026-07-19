@@ -6,12 +6,6 @@ import db from "../services/database.service";
 import storageService from "../services/storage.service";
 
 export class CommitController {
-    // createCommit : bake the workspace's uncommitted changes into a new commit
-    // (spec 03_commit §2). The client sends only the message — the author is the
-    // authenticated user and the changes are read from workspace_changes. The
-    // heavy lifting (tree rebuild, commit hash, head CAS, clearing changes) runs
-    // atomically in storageService.createCommit. Workspaces are private per user,
-    // so ownership is asserted here on top of the repo membership middleware.
     static async createCommit(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please login to continue");
@@ -68,14 +62,6 @@ export class CommitController {
         }
     }
 
-    // getCommitHistory : list the commits made in this workspace since it forked,
-    // newest first (spec 01_storage §"following the parent chain walks history").
-    // Scope is provenance — commits carrying this workspace's parentWorkspaceId,
-    // which are exactly the ones created here after the fork point; history
-    // inherited before the fork carries a different (or null) parentWorkspaceId.
-    // Repo membership + view permission are enforced by middleware; this also
-    // asserts the workspace belongs to this repo AND to the caller (workspaces
-    // are private per user).
     static async getCommitHistory(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please login to continue");
@@ -96,10 +82,6 @@ export class CommitController {
             if (!workspace || workspace.repoId !== repoId || workspace.userId !== req.user.sub) {
                 throw new NotFoundError("Workspace not found");
             }
-
-            // Fetch one extra row to detect a next page without a separate count.
-            // (timestamp, commitHash) is a stable total order, so the cursor never
-            // skips or repeats a commit; commitHash (the PK) anchors the keyset.
             const rows = await db.prisma.commit.findMany({
                 where: { parentWorkspaceId: workspaceId },
                 orderBy: [{ timestamp: "desc" }, { commitHash: "desc" }],

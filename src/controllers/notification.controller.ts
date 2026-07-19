@@ -35,9 +35,6 @@ export class NotificationController {
 
     }
 
-    // markAsRead - Marks one notification as read. updateMany scoped to the
-    // caller's inbox does the ownership check and the update in one query —
-    // count 0 means "not yours or doesn't exist", indistinguishable on purpose.
     static async markAsRead(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Not authenticated");
@@ -60,8 +57,6 @@ export class NotificationController {
         }
     }
 
-    // markAllAsRead - Marks every unread notification in the caller's inbox as
-    // read. Idempotent — an already-clean inbox is a success with count 0.
     static async markAllAsRead(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Not authenticated");

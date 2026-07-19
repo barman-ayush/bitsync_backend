@@ -1,5 +1,4 @@
 import { NextFunction, Request, Response } from "express";
-import { ConflictResolution } from "../generated/prisma/client";
 import { handleError } from "../middlewares/error.middleware";
 import { BadRequestError, ForbiddenError, NotFoundError, UnauthorizedError } from "../errors/app.error";
 import { createPullRequestSchema, prSchema, listPrQuerySchema, prDetailsSchema, createCommentSchema, deleteCommentSchema, resolveConflictsSchema, prMergeabilitySchema, listAssignedReviewsSchema, listAssignedReviewsQuerySchema, reviewerPrViewSchema, addReviewersSchema, submitReviewSchema, prReviewStatusSchema, prIdentifierSchema } from "../validators/pr.validators";
@@ -176,10 +175,6 @@ export class PRController {
                 validReviewerUsers = await PRController.validateReviewersHelper(repoId, reviewerUserIds, userId);
             }
 
-            // if (repositoryActive.headCommit) {
-            //     const commitTrail = await storageService.mergeBase(repositoryActive.headCommit, workspaceExists.head);
-            //     if (commitTrail[0] == workspaceExists.head) throw new BadRequestError("Cannot create PR for empty workspace, need at least one commit.");
-            // }
             const isActivePR = await db.prisma.pullRequest.findFirst({
                 where: { repoId, workspaceId, status: "OPEN" }
             });

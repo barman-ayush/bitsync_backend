@@ -8,9 +8,7 @@ import cloudinaryService from "../services/cloudinary.service";
 import { repositoryId } from "../validators/repo.validator";
 import { hashBlobContent } from "../utils/blob.utils";
 
-// Cap on a single uploaded blob (raw file content). Keeps one request from
-// buffering an unbounded payload into memory; the FE should reject larger files
-// client-side before attempting an upload.
+// Blob size limit
 const MAX_BLOB_BYTES = 10 * 1024 * 1024;
 
 export class WorkspaceController {
@@ -59,9 +57,7 @@ export class WorkspaceController {
             const { repoId } = parsedParams.data;
             const { cursor, limit } = parsedQuery.data;
 
-            // Fetch one extra row to detect whether another page exists without a
-            // separate count query. (updatedAt, id) gives a stable total order so
-            // the cursor never skips or repeats rows when workspaces change.
+
             const rows = await db.prisma.workspace.findMany({
                 where: { userId: req.user.sub, repoId },
                 orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
@@ -93,8 +89,6 @@ export class WorkspaceController {
 
             const { repoId, workspaceName } = parsed.data;
 
-            // Scoped to the caller, matching create/list — workspace names are
-            // unique per (repo, user), so another user's identical name is irrelevant.
             const existing = await db.prisma.workspace.findFirst({
                 where: { repoId, userId: req.user.sub, name: workspaceName },
                 select: { id: true },
@@ -110,11 +104,7 @@ export class WorkspaceController {
     }
 
     // getUncommittedStatus : whether the workspace has any uncommitted changes
-    // pending in workspace_changes. Returns { hasChanges: false } when the working
-    // dir is clean, true otherwise — the FE uses this to enable/disable "Commit".
-    // Repo membership + view permission are enforced by middleware; this also
-    // asserts the workspace belongs to this repo AND to the caller (workspaces are
-    // private per user).
+    // pending in workspace_changes.
     static async getUncommittedStatus(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please login to continue");
@@ -131,8 +121,6 @@ export class WorkspaceController {
             if (!workspace || workspace.repoId !== repoId || workspace.userId !== req.user.sub) {
                 throw new NotFoundError("Workspace not found");
             }
-            // Existence check only — findFirst stops at the first row, so no full
-            // count is paid just to answer a boolean.
             const pending = await db.prisma.workspaceChange.findFirst({
                 where: { workspaceId },
                 select: { id: true },
@@ -147,9 +135,7 @@ export class WorkspaceController {
     }
 
     // getWorkspaceTree : one directory level of a workspace, committed entries
-    // overlaid with uncommitted changes (spec 03_commit §1.4). Repo membership +
-    // view permission are enforced by middleware; this also asserts the workspace
-    // belongs to this repo AND to the caller (workspaces are private per user).
+    // overlaid with uncommitted changes.
     static async getWorkspaceTree(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please login to continue");
@@ -205,13 +191,7 @@ export class WorkspaceController {
 
 
     // uploadBlob : store raw file content as a content-addressed blob and return
-    // its hash. The body is the raw bytes (Content-Type: application/octet-stream),
-    // parsed by an express.raw() middleware on this route. Content is pushed to
-    // Cloudinary (authenticated raw resource, public_id == hash) and only the
-    // metadata row is kept in the DB. Blobs are global and immutable — identical
-    // content dedups to one row — so this is idempotent and keyed by the computed
-    // hash. The client uploads content here first, then registers the resulting
-    // hash via uploadWorkspaceChanges, and later reads it back via getBlob.
+    // its hash. The body is the raw bytes (Content-Type: application/octet-stream).
     static async uploadBlob(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please login to continue");
@@ -255,12 +235,7 @@ export class WorkspaceController {
         }
     }
 
-    // getBlob : mint a short-lived signed URL the FE uses to download a blob's raw
-    // content from Cloudinary. Content is stored under "authenticated" delivery, so
-    // it is never publicly reachable — access is gated here by repo membership +
-    // view permission (middleware), then a signed URL is generated per request.
-    // Blobs are global/content-addressed, so this is keyed by hash, not by repo;
-    // the unguessable 64-char hash is itself the capability to read the content.
+    // getBlob : mint a short-lived signed Cloudinary URL for authorized raw blob downloads.
     static async getBlob(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             if (!req.user) throw new UnauthorizedError("Please login to continue");
@@ -288,8 +263,8 @@ export class WorkspaceController {
     }
 
     // uploadWorkspaceChanges : batch upsert of uncommitted changes into
-    // workspace_changes (the dirty working dir — no staging area). The client
-    // sends only (filePath, blobHash); the server derives the ChangeAction by
+    // workspace_changes (the dirty working dir — no staging area).
+    // The server derives the ChangeAction by
     // comparing each path against the workspace HEAD tree:
     //   blobHash null  + path in HEAD      -> DELETE
     //   blobHash null  + path not in HEAD  -> no-op (drop any pending row)
@@ -330,8 +305,7 @@ export class WorkspaceController {
                 )?.rootTree ?? null
                 : null;
 
-            // Every ADD/MODIFY must reference an already-uploaded blob (01_storage
-            // §3.6) — reject the whole batch if any is missing, before writing.
+            // Every ADD/MODIFY must reference an already-uploaded blob.
             const referenced = [...new Set(changes.filter((c) => c.blobHash).map((c) => c.blobHash as string))];
             if (referenced.length > 0) {
                 const found = await db.prisma.blob.findMany({

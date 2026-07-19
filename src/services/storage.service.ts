@@ -6,12 +6,10 @@ import db from "./database.service";
 
 const MAX_DEPTH = 256;
 
-// All BitSync timestamps are stored in IST (01_storage §7); the commit hash
-// embeds the matching UTC offset so a recomputed hash verifies byte-for-byte.
+// Timestamps stored in IST.
 const COMMIT_TIMEZONE = "+0530";
 
-// Number of path segments in a directory prefix, used to order dirty dirs
-// deepest-first for the bottom-up rebuild. "" -> 0, "src/" -> 1, "src/lib/" -> 2.
+// Counts path segments to determine directory depth.
 const dirDepth = (dirPath: string): number => (dirPath.match(/\//g) ?? []).length;
 class StorageService {
     private static instance: StorageService;
@@ -24,25 +22,16 @@ class StorageService {
         return this.instance;
     }
 
-    // resolveTrees : one directory level of a tree (spec 03_commit §1.3).
-    // Lazy by design — subtrees are fetched on demand by separate calls, never
-    // recursed here, so a huge repo never loads in one shot.
-    //
-    // Two batched queries, never N+1: (1) the tree's entries, (2) the sizes of
-    // every blob entry in a single `IN`. Errors propagate to the caller's
-    // handler rather than being swallowed — an empty directory and a failed
-    // read must not look identical.
+    // Fetches one directory level; batches blob size lookups to avoid N+1.
     public async resolveTrees(treeHash: string): Promise<ResolvedTree> {
-        // Folders first, then files, each group alphabetical. The EntryType enum
-        // is declared blob-before-tree, so Postgres orders blob < tree; `desc`
-        // therefore puts trees (folders) ahead of blobs.
+        // Folders first, then files, each alphabetical.
         const entries = await db.prisma.treeEntry.findMany({
             where: { parentTree: treeHash },
             select: { name: true, entryType: true, objectHash: true },
             orderBy: [{ entryType: "desc" }, { name: "asc" }],
         });
 
-        // Collect distinct blob hashes and fetch all their sizes in one query.
+        // Batch-fetch sizes for all blobs in one query.
         const blobHashes = [
             ...new Set(entries.filter((e) => e.entryType === "blob").map((e) => e.objectHash)),
         ];
@@ -53,8 +42,7 @@ class StorageService {
                 where: { blobHash: { in: blobHashes } },
                 select: { blobHash: true, size: true },
             });
-            // size is BigInt in the DB; file sizes fit in a JS number (< 2^53)
-            // and BigInt is not JSON-serialisable, so coerce to Number here.
+            // BigInt is not JSON-serialisable; coerce to Number.
             for (const b of blobs) sizeByHash.set(b.blobHash, Number(b.size));
         }
 
@@ -69,34 +57,25 @@ class StorageService {
         };
     }
 
-    // resolveWorkspaceTree : one directory level overlaid with the workspace's
-    // uncommitted changes (spec 03_commit §1.4), tagging every entry with a
-    // status so the FE can highlight added/modified/deleted/dirty rows.
-    //
-    // `currentPath` is a directory prefix the client builds as the user drills in
-    // ("", then "src/", then "src/utils/"). `treeHash` is the committed tree for
-    // this level, or null when the workspace has no commits yet (empty repo).
+    // Returns one directory level merged with uncommitted workspace changes,
+    // tagging each entry with its status (ADDED/MODIFIED/DELETED/COMMITTED).
     public async resolveWorkspaceTree(
         workspaceId: string,
         treeHash: string | null,
         currentPath: string = "",
     ): Promise<WorkspaceTree> {
-        // 1. Committed view of this level (empty when the workspace has no commits).
+        // Committed entries for this level; empty if no commits yet.
         const committed = treeHash ? (await this.resolveTrees(treeHash)).entries : [];
 
-        // 2. Uncommitted changes under this prefix. `startsWith` compiles to a
-        //    LIKE 'prefix%', which treats `_` and `%` as wildcards — so a prefix
-        //    like "my_utils/" would also match "myXutils/". Re-assert the prefix
-        //    exactly in JS to drop those over-matched rows.
+        // Re-filter in JS to drop over-matched rows from the DB prefix query.
         const rawChanges = await db.prisma.workspaceChange.findMany({
             where: { workspaceId, filePath: { startsWith: currentPath } },
             select: { filePath: true, action: true, blobHash: true },
         });
         const changes = rawChanges.filter((c) => c.filePath.startsWith(currentPath));
 
-        // 3. Collapse to immediate children of currentPath. Anything nested deeper
-        //    than one level only marks its top-level subfolder as modified — its
-        //    own blobs are revealed when the user expands that folder.
+        // Collapse changes to immediate children; deeper paths just mark their
+        // top-level subfolder as a dirty subtree.
         type Immediate =
             | { kind: "file"; action: string; blobHash: string | null }
             | { kind: "subtree" };
@@ -105,16 +84,16 @@ class StorageService {
             const relative = c.filePath.slice(currentPath.length);
             const slash = relative.indexOf("/");
             if (slash === -1) {
-                // direct file in this directory
+                // Direct file in this directory.
                 immediate.set(relative, { kind: "file", action: c.action, blobHash: c.blobHash });
             } else {
-                // file deeper inside a subdirectory -> flag that subdirectory
+                // Deeper file — flag its immediate parent as a dirty subtree.
                 const subDirectory = relative.slice(0, slash) + "/";
                 if (!immediate.has(subDirectory)) immediate.set(subDirectory, { kind: "subtree" });
             }
         }
 
-        // Batch-fetch sizes for every blob referenced by a change (one query).
+        // Batch-fetch sizes for all changed blobs.
         const changeBlobHashes = [
             ...new Set(
                 [...immediate.values()].flatMap((c) =>
@@ -133,10 +112,9 @@ class StorageService {
 
         const result: WorkspaceTreeEntry[] = [];
 
-        // 4. Merge committed entries with the changes that touch them. Trees match
-        //    a subtree marker ("name/"); blobs match a file change ("name").
+        // Overlay uncommitted changes onto committed entries.
         for (const entry of committed) {
-            // Folder cases
+            // Directory entry.
             if (entry.type === "tree") {
                 const key = entry.name + "/";
                 if (immediate.has(key)) {
@@ -148,21 +126,21 @@ class StorageService {
                 continue;
             }
 
-            // Files
+            // File entry.
             const change = immediate.get(entry.name);
             if (!change || change.kind !== "file") {
-                // This file was not touched in uncommitted changes
+                // No uncommitted change for this file.
                 result.push({ ...entry, status: "COMMITTED" });
                 continue;
             }
 
-            // This file was modified/deleted in the uncommitted changes
+            // File was modified or deleted in uncommitted changes.
             immediate.delete(entry.name);
 
             if (change.action === "DELETE") {
                 result.push({ ...entry, status: "DELETED" });
             } else {
-                // MODIFY (or a degenerate ADD over an existing path): new content.
+                // MODIFY (or ADD over an existing path): use new blob.
                 result.push({
                     name: entry.name,
                     type: "blob",
@@ -173,14 +151,13 @@ class StorageService {
             }
         }
 
-        // 5. Anything left has no committed counterpart — newly added files/folders.
+        // Remaining entries have no committed counterpart — newly added.
         for (const [name, change] of immediate) {
             if (change.kind === "subtree") {
-                // a new file under a path with no committed tree implies a new folder
+                // New file under an uncommitted path → new folder.
                 result.push({ name: name.slice(0, -1), type: "tree", objectHash: null, status: "ADDED" });
             } else if (change.action === "ADD" || change.action === "MODIFY") {
-                // ADD = brand-new file. A MODIFY with no committed entry is a data
-                // inconsistency; surface it as added rather than dropping it.
+                // MODIFY with no committed entry is a data inconsistency; treat as ADD.
                 result.push({
                     name,
                     type: "blob",
@@ -189,10 +166,10 @@ class StorageService {
                     status: "ADDED",
                 });
             }
-            // a leftover DELETE has nothing to show — not committed here, now gone.
+            // Leftover DELETE with no committed entry — nothing to show.
         }
 
-        // Folders first, then files, alphabetical within each (type DESC, name ASC).
+        // Folders first, then files, each group alphabetical.
         result.sort((a, b) =>
             a.type !== b.type
                 ? a.type < b.type ? 1 : -1
@@ -202,15 +179,7 @@ class StorageService {
         return { treeHash, entries: result };
     }
 
-    // lookupBlobAtPath : resolve a repo-root-relative file path against a
-    // committed root tree, returning the blob hash stored there, or null if the
-    // path does not exist as a file in that tree. This is the authoritative
-    // "what does HEAD have at this path?" check that decides ADD vs MODIFY vs
-    // DELETE when staging workspace changes.
-    //
-    // Walks one directory level per path segment (treeEntry is keyed by
-    // (parentTree, name)). Returns null the moment a segment is missing, or a
-    // non-final segment is a blob rather than a tree (a file can't have children).
+    // Walks a committed tree by path, returning the blob hash or null if not found.
     public async lookupBlobAtPath(
         rootTreeHash: string | null,
         filePath: string,
@@ -218,9 +187,7 @@ class StorageService {
         if (!rootTreeHash) return null;
 
         const segments = filePath.split("/");
-        // Non-null from here (rootTreeHash was guarded above); reassigned to each
-        // descended subtree. Explicitly typed to break the inference cycle with
-        // `entry.objectHash` feeding back into the next findUnique argument.
+        // Explicitly typed to break the inference cycle in the loop below.
         let currentTree: string = rootTreeHash;
 
         for (let i = 0; i < segments.length; i++) {
@@ -234,11 +201,11 @@ class StorageService {
             if (!entry) return null;
 
             if (isLast) {
-                // The path resolves to a file only if the final entry is a blob.
+                // Valid only if the final segment is a blob.
                 return entry.entryType === "blob" ? entry.objectHash : null;
             }
 
-            // Intermediate segment must be a directory to descend into.
+            // Intermediate segments must be directories.
             if (entry.entryType !== "tree") return null;
             currentTree = entry.objectHash;
         }
@@ -246,15 +213,9 @@ class StorageService {
         return null;
     }
 
-    // flatten_tree : recursively walk a tree and produce a flat path -> hash map
-    // (spec 03_commit §2.5). This is the bottleneck of commit creation: every
-    // file in the parent commit is visited once, O(n) in repo size.
-    //
-    // Blobs are keyed by full path ("src/main.py"); directories are *also*
-    // recorded under their trailing-slash path ("src/") alongside their children,
-    // so the rebuild step can reuse an unchanged subtree by its hash. A null
-    // tree_hash (empty repo with no commits) flattens to an empty map, never null,
-    // so the recursive merge and downstream callers never need a null check.
+    // Recursively walks a tree and returns a flat path → hash map.
+    // Blobs are keyed by path ("src/main.py"); directories by trailing-slash path ("src/").
+    // Null tree_hash returns an empty map.
     // #TODO (Later) : Add WorkspaceIndex Table and flatten the tree from there
     public async flatten_tree(
         tree_hash: string | null,
@@ -278,7 +239,7 @@ class StorageService {
             if (entry.entryType === "blob") {
                 path_map[fullPath] = { type: "blob", hash: entry.objectHash };
             } else {
-                // Recurse into the subdirectory, then record the directory itself.
+                // Recurse, then record the directory entry.
                 const subPaths = await this.flatten_tree(entry.objectHash, fullPath + "/", depth + 1);
                 Object.assign(path_map, subPaths);
                 path_map[fullPath + "/"] = { type: "tree", hash: entry.objectHash };
@@ -288,14 +249,8 @@ class StorageService {
         return path_map;
     }
 
-    // build_tree_from_changes : given the parent commit and a set of uncommitted
-    // changes, produce the new root tree hash, persisting every tree object that
-    // lies on a dirty path (spec 03_commit §2.3). Clean subtrees are reused by
-    // hash reference, so only O(changes * depth) tree objects are written.
-    //
-    // Pass `tx` to run inside the commit's transaction (atomic with the commit
-    // insert); it defaults to the shared client. Returns the root tree hash — the
-    // caller stores it as `commit.root_tree`.
+    // Applies uncommitted changes to the parent tree, persisting only dirty tree
+    // objects. Clean subtrees are reused by hash. Returns the new root tree hash.
     public async build_tree_from_changes(
         parentCommit: ParentCommitRef,
         changes: BuildTreeChange[],
@@ -305,16 +260,14 @@ class StorageService {
 
         const pathMap = await this.flatten_tree(parentRootTree);
 
-        // Snapshot the parent's directory -> tree_hash map *before* mutating, for
-        // clean-subtree reuse. flatten_tree records every directory under its
-        // trailing-slash key, so we lift those out plus the root ("").
+        // Snapshot parent directory hashes before mutating, for clean-subtree reuse.
         const parentDirMap: Record<string, string> = {};
         if (parentRootTree) parentDirMap[""] = parentRootTree;
         for (const [path, info] of Object.entries(pathMap)) {
             if (info.type === "tree") parentDirMap[path] = info.hash;
         }
 
-        // ADD must not clobber, MODIFY/DELETE must hit an existing file.
+        // Validate changes: ADD must not clobber, MODIFY/DELETE require an existing entry.
         for (const change of changes) {
             const existing = pathMap[change.filePath];
             switch (change.action) {
@@ -335,19 +288,17 @@ class StorageService {
             }
         }
 
-        // Mark every ancestor directory of each changed file as dirty.
-        // The root ("") is always dirty when there is at least one change.
+        // Mark all ancestor directories of changed files as dirty; root is always dirty.
         const dirtyDirs = new Set<string>([""]);
         for (const change of changes) {
             const segments = change.filePath.split("/");
             for (let i = 0; i < segments.length - 1; i++) {
-                // dirtyDirs contain file path with trailing slashes
+                // Trailing slash convention for directory paths.
                 dirtyDirs.add(segments.slice(0, i + 1).join("/") + "/");
             }
         }
 
-        // Rebuild dirty trees bottom-up (deepest first) so a parent always
-        // sees its children's freshly computed hashes in `newTreeHashes`.
+        // Rebuild dirty trees bottom-up so each parent sees its children's new hashes.
         const sortedDirtyDirs = [...dirtyDirs].sort((a, b) => dirDepth(b) - dirDepth(a));
         const newTreeHashes: Record<string, string> = {};
 
@@ -363,11 +314,10 @@ class StorageService {
 
                 const childDirPath = dirPath + childName + "/";
                 if (dirtyDirs.has(childDirPath)) {
-                    // Dirty subtree — point at the hash we just built for it.
+                    // Dirty subtree — use the freshly computed hash.
                     entries.push({ type: "tree", name: childName, objectHash: newTreeHashes[childDirPath] });
                 } else {
-                    // Clean subtree — reuse the parent commit's hash untouched. A new
-                    // directory would have been marked dirty, so a miss here is a bug.
+                    // Clean subtree — reuse parent's hash. A miss here is a bug.
                     const reuseHash = parentDirMap[childDirPath];
                     if (!reuseHash) {
                         throw new InternalError(
@@ -378,8 +328,7 @@ class StorageService {
                 }
             }
 
-            // Content-address the tree, then store it (and its entries) only when
-            // this exact hash is new — identical trees dedupe across commits.
+            // Store the tree only if new — identical trees dedupe across commits.
             const treeHash = hashTrees(entries);
             const exists = await tx.tree.findUnique({ where: { treeHash }, select: { treeHash: true } });
             if (!exists) {
@@ -399,13 +348,12 @@ class StorageService {
             newTreeHashes[dirPath] = treeHash;
         }
 
-        // The root tree hash is the snapshot's identity.
+        // Root tree hash is the commit snapshot identity.
         return newTreeHashes[""];
     }
 
-    // getImmediateChildren : collapse the flat path map to the direct children of
-    // `dirPath` (spec 03_commit §2.7). A direct file becomes a blob child; any
-    // deeper path collapses to its top-level subdirectory marked as a tree.
+    // Returns the direct children of `dirPath` from the flat path map.
+    // Deeper paths are collapsed to their immediate subdirectory.
     private getImmediateChildren(
         pathMap: PathMap,
         dirPath: string,
@@ -419,11 +367,10 @@ class StorageService {
             const slash = relative.indexOf("/");
 
             if (info.type === "blob" && slash === -1) {
-                // Direct file in this directory, e.g. "main.py".
+                // Direct file.
                 children.set(relative, { type: "blob", hash: info.hash });
             } else {
-                // A subdirectory — either its own trailing-slash entry or a nested
-                // file/dir below it. First segment names the immediate child.
+                // Subdirectory — take the first segment as the immediate child name.
                 const childName = slash === -1 ? relative : relative.slice(0, slash);
                 if (!children.has(childName)) children.set(childName, { type: "tree" });
             }
@@ -432,11 +379,8 @@ class StorageService {
         return children;
     }
 
-    // getAllParents : return every parent hash for a commit, ordered by ordinal
-    // (spec 01_storage §5.1). Merge commits store their parents in the
-    // `commit_parents` join table; regular commits have a single `parent` field.
-    // Falls back to the scalar parent when no `commit_parents` rows exist, so
-    // all graph walkers can use a single code-path.
+    // Returns all parent hashes for a commit, ordered by ordinal.
+    // Falls back to the scalar parent field for regular (non-merge) commits.
     public async getAllParents(commitHash: string): Promise<string[]> {
         const mergeParents = await db.prisma.commitParent.findMany({
             where: { commitHash },
@@ -448,7 +392,7 @@ class StorageService {
             return mergeParents.map((r) => r.parentHash);
         }
 
-        // Regular (non-merge) commit — fall back to the single parent field.
+        // Non-merge commit — fall back to the scalar parent field.
         const commit = await db.prisma.commit.findUnique({
             where: { commitHash },
             select: { parent: true },
@@ -457,14 +401,13 @@ class StorageService {
         return [];
     }
 
-    // merge_base : Find the LCA using multisource BFS.
-    // convention : commitA -> repoHead, commitB -> workspaceHead
-    // LCA always lies on the main repo commit line (returned null when empty repo)
+    // Finds the LCA of two commits using BFS. commitA = repoHead, commitB = workspaceHead.
+    // Returns the path from LCA to commitB, or empty if histories are disjoint.
     public async mergeBase(commitA: string | null, commitB: string): Promise<(string | null)[]> {
         if (!commitB) return [];
         if (commitA === commitB) return [commitA];
 
-        // Case: commitA is null (e.g. empty repository mainline)
+        // Empty mainline — walk commitB's entire ancestry chain.
         if (commitA === null) {
             const trail: (string | null)[] = [commitB];
             let current = commitB;
@@ -477,11 +420,11 @@ class StorageService {
                 trail.push(current);
             }
             trail.push(null);
-            // trail.reverse() = [null, workspace_first_commit , ... , workspaceHead]
+            // [null, first_commit, ..., workspaceHead]
             return trail.reverse();
         }
 
-        // commit_hash → depth from the starting tip.
+        // Tracks visited commits and their BFS depth.
         const visitedA = new Map<string, number>([[commitA, 0]]);
         const visitedB = new Map<string, number>([[commitB, 0]]);
         let queueA: string[] = [commitA];
@@ -490,7 +433,7 @@ class StorageService {
         let isComplete = false;
 
         while (queueA.length > 0 || queueB.length > 0) {
-            // Expand one level from side A.
+            // BFS step from side A.
             if (queueA.length > 0) {
                 const nextA: string[] = [];
                 for (const current of queueA) {
@@ -512,7 +455,7 @@ class StorageService {
                 queueA = nextA;
             }
 
-            // Expand one level from side B.
+            // BFS step from side B.
             if (queueB.length > 0) {
                 const nextB: string[] = [];
                 for (const current of queueB) {
@@ -540,7 +483,7 @@ class StorageService {
             return [];
         }
 
-        // Reconstruct the path from lowestCommonAncestor to commitB (workspaceHead)
+        // Walk back from commitB to the LCA, then reverse to get [LCA, ..., commitB].
         let current = commitB;
         const trail: string[] = [current];
         while (current !== lowestCommonAncestor) {
@@ -550,14 +493,10 @@ class StorageService {
             trail.push(current);
         }
 
-        // trail is currently [commitB, ..., lowestCommonAncestor]
-        // Reverse it to get [lowestCommonAncestor, ..., commitB]
         return trail.reverse();
     }
 
-    // isAncestorOf : check if `ancestor` is reachable by walking back from
-    // `descendant` through all parents (spec 01_storage §5.1). Single BFS
-    // that short-circuits the moment the target is found.
+    // Returns true if `ancestor` is reachable by walking back from `descendant`.
     public async isAncestorOf(ancestor: string, descendant: string): Promise<boolean> {
         if (ancestor === descendant) return true;
 
@@ -579,15 +518,9 @@ class StorageService {
         return false;
     }
 
-    // createCommit : bake a workspace's uncommitted changes into a new commit
-    // (spec 03_commit §2.4). Builds the new tree (reusing clean subtrees), stores
-    // the commit, advances the workspace head with a compare-and-swap, and clears
-    // the now-committed changes — all in one transaction so a half-applied commit
-    // can never land. Ownership and permissions are enforced by the caller.
-    //
-    // The compare-and-swap on `head` (STEP 6) is the only concurrency guard: if a
-    // second commit moved the head after we read it, the CAS matches zero rows and
-    // we abort rather than silently overwriting the first commit.
+    // Bakes uncommitted workspace changes into a new commit atomically:
+    // builds the tree, stores the commit, advances HEAD via CAS, and clears changes.
+    // CAS on `head` guards against concurrent commits.
     public async createCommit({ input, tx }: { input: CreateCommitInput, tx: Prisma.TransactionClient | null }): Promise<CreateCommitResult> {
         const { workspaceId, author, message } = input;
         const prismaClient = tx || db.prisma;
@@ -608,8 +541,7 @@ class StorageService {
         });
         if (changes.length === 0) throw new BadRequestError("Nothing to commit — no uncommitted changes.");
 
-        // Parent commit's root tree (null on the first commit of an empty repo,
-        // where every change is necessarily an ADD).
+        // Root tree of the parent commit; null for the very first commit.
         const parentHead = workspace.head;
         const parentCommit = parentHead
             ? await prismaClient.commit.findUnique({
@@ -618,8 +550,7 @@ class StorageService {
             })
             : null;
 
-        //  Every ADD/MODIFY must reference an already-uploaded blob (blobs
-        //  are uploaded before the commit request — 01_storage §3.6).
+        // Every ADD/MODIFY must reference a blob that was already uploaded.
         const referenced = [
             ...new Set(changes.filter((c) => c.action !== "DELETE" && c.blobHash).map((c) => c.blobHash as string)),
         ];
@@ -635,23 +566,20 @@ class StorageService {
             }
         }
 
-        // Timestamp is part of the commit hash as unix seconds (spec §5.5); the
-        // matching Date is stored on the row, in IST like every other timestamp.
+        // Timestamp (unix seconds) is part of the commit hash.
         const committedAt = new Date();
         const timestamp = Math.floor(committedAt.getTime() / 1000);
 
-        // the new tree objects, the commit row, the
-        // head advance, and the cleared changes either all land or none do.
+        // All writes (tree objects, commit row, head advance, change deletion) are atomic.
         const runTransaction = async (txClient: Prisma.TransactionClient) => {
-            // STEP 3: rebuild only the trees on dirty paths; reuse the rest by hash.
+            // STEP 3: rebuild dirty trees; reuse clean subtrees by hash.
             const newRootTree = await this.build_tree_from_changes(
                 { rootTree: parentCommit?.rootTree ?? null },
                 changes,
                 txClient,
             );
 
-            // STEP 4: content-address the commit. Initial commit omits the parent
-            // line entirely, so `parents` is empty when there is no head yet.
+            // STEP 4: content-address the commit (no parent on first commit).
             const parents = parentHead ? [parentHead] : [];
             const commitHash = hashCommit({
                 rootTree: newRootTree,
@@ -662,8 +590,7 @@ class StorageService {
                 message,
             });
 
-            // STEP 5: store the commit. Upsert on the hash dedups an identical
-            // snapshot (same tree, parent, author, timestamp, message).
+            // STEP 5: store the commit; upsert dedupes identical snapshots.
             await txClient.commit.upsert({
                 where: { commitHash },
                 update: {},
@@ -678,7 +605,7 @@ class StorageService {
                 },
             });
 
-            // STEP 6: advance the head only if it still points where we read it.
+            // STEP 6: CAS — advance head only if it hasn't moved.
             const moved = await txClient.workspace.updateMany({
                 where: { id: workspaceId, head: parentHead },
                 data: { head: commitHash },
@@ -687,7 +614,7 @@ class StorageService {
                 throw new ConflictError("Concurrent commit detected — workspace head moved. Retry.");
             }
 
-            // STEP 7: the changes are now baked into the commit — clear them.
+            // STEP 7: clear the now-committed changes.
             await txClient.workspaceChange.deleteMany({ where: { workspaceId } });
 
             return { commitHash, rootTree: newRootTree, parent: parentHead, changeCount: changes.length };
@@ -700,27 +627,17 @@ class StorageService {
         }
     }
 
-    // getTreeDiff : recursively compare two tree snapshots and produce a flat
-    // list of file-level changes (ADD, MODIFY, DELETE, RENAME). Identical
-    // subtrees are short-circuited by hash (Merkle optimisation), so only
-    // divergent branches are walked.
-    //
-    // `repoTreeHash` is the root tree of the repo's HEAD commit (null if the
-    // repo has no commits yet — everything in the PR is an ADD).
-    // `prTreeHash` is the root tree of the PR's head commit.
-    // `currentPath` is the directory prefix built as we recurse ("", "src/", …).
+    // Recursively diffs two trees, returning a flat list of ADD/MODIFY/DELETE/RENAME entries.
+    // Identical subtrees are skipped via hash comparison (Merkle shortcut).
     public async getTreeDiff(
         repoTreeHash: string | null,
         prTreeHash: string | null,
         currentPath: string = "",
     ): Promise<DiffEntry[]> {
-        // Both null → nothing to compare.
-        if (!repoTreeHash && !prTreeHash) return [];
+        if (!repoTreeHash && !prTreeHash) return [];   // Nothing to compare.
+        if (repoTreeHash === prTreeHash) return [];     // Identical subtree — skip.
 
-        // Same hash → identical subtree, no changes at all.
-        if (repoTreeHash === prTreeHash) return [];
-
-        // ── Resolve both sides ──────────────────────────────────────────────
+        // Resolve both sides.
         const repoEntries = repoTreeHash
             ? (await this.resolveTrees(repoTreeHash)).entries
             : [];
@@ -728,7 +645,7 @@ class StorageService {
             ? (await this.resolveTrees(prTreeHash)).entries
             : [];
 
-        // Build lookup maps: name → { type, objectHash, size? }
+        // Build name → entry maps for quick lookup.
         const repoMap = new Map<string, { type: TreeEntryType; objectHash: string; size?: number }>();
         for (const e of repoEntries) {
             repoMap.set(e.name, { type: e.type, objectHash: e.objectHash, size: e.size });
@@ -739,29 +656,28 @@ class StorageService {
             prMap.set(e.name, { type: e.type, objectHash: e.objectHash, size: e.size });
         }
 
-        // Collect all unique names across both sides.
+        // All unique names across both sides.
         const allNames = new Set<string>([...repoMap.keys(), ...prMap.keys()]);
 
         const diffs: DiffEntry[] = [];
 
-        // Candidates for rename detection — names that exist on only one side.
+        // Single-side entries are rename candidates.
         const deleteCandidates: { name: string; type: TreeEntryType; objectHash: string }[] = [];
         const addCandidates: { name: string; type: TreeEntryType; objectHash: string; size?: number }[] = [];
 
-        // ── Pass 1: classify each name ──────────────────────────────────────
+        // Pass 1: classify each name.
         for (const name of allNames) {
             const repoEntry = repoMap.get(name);
             const prEntry = prMap.get(name);
 
             if (repoEntry && prEntry) {
-                // Name exists on BOTH sides.
                 if (repoEntry.objectHash === prEntry.objectHash) {
-                    // Identical content — skip (unchanged).
+                    // Identical — skip.
                     continue;
                 }
 
                 if (repoEntry.type === "blob" && prEntry.type === "blob") {
-                    // Same name, different blob hash → MODIFY.
+                    // Same name, different blob → MODIFY.
                     diffs.push({
                         path: currentPath + name,
                         type: "blob",
@@ -771,7 +687,7 @@ class StorageService {
                         size: prEntry.size,
                     });
                 } else if (repoEntry.type === "tree" && prEntry.type === "tree") {
-                    // Both are directories with different hashes → recurse.
+                    // Different directory hashes → recurse.
                     const subtreeDiffs = await this.getTreeDiff(
                         repoEntry.objectHash,
                         prEntry.objectHash,
@@ -779,8 +695,7 @@ class StorageService {
                     );
                     diffs.push(...subtreeDiffs);
                 } else {
-                    // Type mismatch (blob↔tree) — treat as DELETE old + ADD new.
-                    // Expand the old side fully as DELETEs.
+                    // Type mismatch (blob↔tree) — DELETE old, ADD new.
                     if (repoEntry.type === "tree") {
                         const deleted = await this.expandTreeAsDiff(
                             repoEntry.objectHash,
@@ -796,7 +711,7 @@ class StorageService {
                             oldObjectHash: repoEntry.objectHash,
                         });
                     }
-                    // Expand the new side fully as ADDs.
+                    // Expand new side as ADDs.
                     if (prEntry.type === "tree") {
                         const added = await this.expandTreeAsDiff(
                             prEntry.objectHash,
@@ -815,17 +730,15 @@ class StorageService {
                     }
                 }
             } else if (repoEntry && !prEntry) {
-                // Name exists ONLY in repo → candidate for DELETE (or rename source).
+                // Only in repo → DELETE or rename source.
                 deleteCandidates.push({ name, type: repoEntry.type, objectHash: repoEntry.objectHash });
             } else if (!repoEntry && prEntry) {
-                // Name exists ONLY in PR → candidate for ADD (or rename target).
+                // Only in PR → ADD or rename target.
                 addCandidates.push({ name, type: prEntry.type, objectHash: prEntry.objectHash, size: prEntry.size });
             }
         }
 
-        // ── Pass 2: rename detection among DELETE/ADD candidates ─────────────
-        // A rename is a blob DELETE + blob ADD with the same objectHash.
-        // Build a reverse map: blobHash → deleted candidate(s).
+        // Pass 2: rename detection — match DELETE+ADD pairs with the same blob hash.
         const deletedByHash = new Map<string, typeof deleteCandidates[number][]>();
         for (const d of deleteCandidates) {
             if (d.type === "blob") {
@@ -842,7 +755,7 @@ class StorageService {
 
             const matchingDeletes = deletedByHash.get(addCandidate.objectHash);
             if (matchingDeletes && matchingDeletes.length > 0) {
-                // Pop the first matching delete — one rename per pair.
+                // One rename per pair.
                 const matchedDelete = matchingDeletes.shift()!;
                 matchedDeletes.add(matchedDelete.name);
 
@@ -858,12 +771,12 @@ class StorageService {
             }
         }
 
-        // ── Pass 3: emit remaining (unmatched) DELETEs and ADDs ─────────────
+        // Pass 3: emit unmatched DELETEs and ADDs.
         for (const d of deleteCandidates) {
-            if (matchedDeletes.has(d.name)) continue; // already consumed by rename
+            if (matchedDeletes.has(d.name)) continue; // consumed by rename
 
             if (d.type === "tree") {
-                // Deleted directory — expand all files inside as individual DELETEs.
+                // Deleted directory — expand all contained files as DELETEs.
                 const deleted = await this.expandTreeAsDiff(
                     d.objectHash,
                     currentPath + d.name + "/",
@@ -881,7 +794,7 @@ class StorageService {
         }
 
         for (const a of addCandidates) {
-            // Skip if this ADD was already matched as a rename.
+            // Skip renames already matched in pass 2.
             if (a.type === "blob" && diffs.some(
                 (d) => d.changeType === "RENAME" && d.path === currentPath + a.name,
             )) {
@@ -889,7 +802,7 @@ class StorageService {
             }
 
             if (a.type === "tree") {
-                // New directory — expand all files inside as individual ADDs.
+                // New directory — expand all contained files as ADDs.
                 const added = await this.expandTreeAsDiff(
                     a.objectHash,
                     currentPath + a.name + "/",
@@ -910,9 +823,7 @@ class StorageService {
         return diffs;
     }
 
-    // expandTreeAsDiff : recursively walk a tree and emit every blob as a
-    // DiffEntry of the given changeType (ADD or DELETE). Used when an entire
-    // directory appears or disappears between the two compared trees.
+    // Recursively emits every blob in a tree as an ADD or DELETE DiffEntry.
     private async expandTreeAsDiff(
         treeHash: string,
         prefix: string,
@@ -932,7 +843,7 @@ class StorageService {
                         : { newObjectHash: entry.objectHash, size: entry.size }),
                 });
             } else {
-                // Recurse into subdirectory.
+                // Recurse into subdirectory
                 const subDiffs = await this.expandTreeAsDiff(
                     entry.objectHash,
                     prefix + entry.name + "/",
@@ -945,23 +856,13 @@ class StorageService {
         return diffs;
     }
 
-    // threeWayTreeMerge : run the full 3-way merge algorithm (spec §4.1) and
-    // return a preview result without writing anything to the database. Used by
-    // the merge-check endpoint so the frontend can show conflicts before the
-    // user triggers the actual merge.
-    //
-    // Inputs:
-    //   oursCommitHash   — repo.headCommit (null if repo is empty → everything is clean ADD)
-    //   theirsCommitHash — workspace.head / pr_head
-    //
-    // Internally computes merge_base to find the BASE commit, then flattens all
-    // three trees and runs the classify/decide matrix per file path.
+    // Runs a 3-way merge preview without writing to the DB.
+    // oursCommitHash = repo HEAD, theirsCommitHash = workspace HEAD.
     public async threeWayTreeMerge(
         oursCommitHash: string | null,
         theirsCommitHash: string | null,
     ): Promise<MergeCheckResult> {
-        // ── Edge case: repo has no commits yet ──────────────────────────────
-        // Everything in the workspace is a clean ADD; no conflicts possible.
+        // Empty repo — everything is a clean ADD, no conflicts possible.
         if (!theirsCommitHash) throw new NotFoundError("No PR head commit found")
         if (!oursCommitHash) {
             const theirsCommit = await db.prisma.commit.findUnique({
@@ -992,7 +893,7 @@ class StorageService {
             };
         }
 
-        // ── Same commit — nothing to merge ──────────────────────────────────
+        // Same commit — nothing to merge.
         if (oursCommitHash === theirsCommitHash) {
             return {
                 canMerge: true,
@@ -1006,16 +907,12 @@ class StorageService {
             };
         }
 
-        // ── STEP 1: Compute the merge base (LCA) ───────────────────────────
+        // STEP 1: compute the LCA. Empty trail means disjoint histories → null base.
         const mergeBaseTrail = await this.mergeBase(oursCommitHash, theirsCommitHash);
-        // mergeBase returns [ lca, ..., workspaceHead ] — element [0] is the LCA
-        // when it is found inside visitedA. If the trail is empty, oursCommit is
-        // unreachable from theirsCommit (disjoint histories); treat as null base.
         const baseCommitHash = mergeBaseTrail.length > 0 ? mergeBaseTrail[0] : null;
 
-        // ── STEP 2: Detect fast-forward ─────────────────────────────────────
+        // STEP 2: fast-forward if repo HEAD is an ancestor of workspace HEAD.
         if (baseCommitHash === oursCommitHash) {
-            // Repo HEAD is an ancestor of workspace HEAD — fast-forward.
             const [oursCommit, theirsCommit] = await Promise.all([
                 oursCommitHash ? db.prisma.commit.findUnique({ where: { commitHash: oursCommitHash }, select: { rootTree: true } }) : null,
                 db.prisma.commit.findUnique({ where: { commitHash: theirsCommitHash }, select: { rootTree: true } }),
@@ -1048,7 +945,7 @@ class StorageService {
             };
         }
 
-        // ── STEP 3: Full 3-way merge — flatten all three trees ──────────────
+        // STEP 3: full 3-way merge — flatten base, ours, and theirs.
         const [baseCommit, oursCommit, theirsCommit] = await Promise.all([
             baseCommitHash
                 ? db.prisma.commit.findUnique({ where: { commitHash: baseCommitHash }, select: { rootTree: true } })
@@ -1066,7 +963,7 @@ class StorageService {
             this.flatten_tree(theirsCommit.rootTree),
         ]);
 
-        // ── STEP 4: Collect all unique file paths (exclude directories) ─────
+        // STEP 4: collect all unique blob paths across all three trees.
         const allPaths = new Set<string>();
         for (const path of Object.keys(baseMap)) {
             if (baseMap[path].type === "blob") allPaths.add(path);
@@ -1078,7 +975,7 @@ class StorageService {
             if (theirsMap[path].type === "blob") allPaths.add(path);
         }
 
-        // ── STEP 5: Classify and decide per path (spec §4.2 / §4.3) ────────
+        // STEP 5: classify each side's change and decide the merge outcome.
         const mergedPaths: Record<string, MergedPathEntry> = {};
         const conflicts: MergeConflictEntry[] = [];
 
@@ -1100,7 +997,7 @@ class StorageService {
                 if (decision.hash !== null) {
                     mergedPaths[path] = { oldBlobHash: oursHash ?? null, newBlobHash: decision.hash };
                 }
-                // else: file is deleted in the merge — omit from merged tree
+                // null hash = file deleted in merge, omit from tree.
             } else {
                 conflicts.push(decision.conflict);
             }
@@ -1122,8 +1019,7 @@ class StorageService {
         };
     }
 
-    // classifyChange : how did a file change between BASE and one side?
-    // (spec §4.2 — "classify" helper)
+    // Classifies how a file changed between BASE and one side.
     private classifyChange(
         baseHash: string | null,
         otherHash: string | null,
@@ -1135,8 +1031,7 @@ class StorageService {
         return "MODIFIED";
     }
 
-    // mergeDecide : given how each side changed, produce a resolved hash or a
-    // conflict record. Follows the decision table in spec §4.3.
+    // Given each side's classification, returns a resolved hash or a conflict.
     private mergeDecide(
         changeOurs: MergeChangeClassification,
         changeTheirs: MergeChangeClassification,
@@ -1145,12 +1040,12 @@ class StorageService {
         baseHash: string | null,
         path: string,
     ): { type: "RESOLVED"; hash: string | null } | { type: "CONFLICT"; conflict: MergeConflictEntry } {
-        // ── Neither side changed ──
+        // Neither changed.
         if (changeOurs === "UNCHANGED" && changeTheirs === "UNCHANGED") {
             return { type: "RESOLVED", hash: baseHash };
         }
 
-        // ── Only THEIRS changed ──
+        // Only THEIRS changed.
         if (changeOurs === "UNCHANGED") {
             if (changeTheirs === "MODIFIED" || changeTheirs === "ADDED") {
                 return { type: "RESOLVED", hash: theirsHash };
@@ -1160,7 +1055,7 @@ class StorageService {
             }
         }
 
-        // ── Only OURS changed ──
+        // Only OURS changed.
         if (changeTheirs === "UNCHANGED") {
             if (changeOurs === "MODIFIED" || changeOurs === "ADDED") {
                 return { type: "RESOLVED", hash: oursHash };
@@ -1170,12 +1065,12 @@ class StorageService {
             }
         }
 
-        // ── Both sides deleted ──
+        // Both deleted.
         if (changeOurs === "DELETED" && changeTheirs === "DELETED") {
             return { type: "RESOLVED", hash: null };
         }
 
-        // ── Both sides added ──
+        // Both added.
         if (changeOurs === "ADDED" && changeTheirs === "ADDED") {
             if (oursHash === theirsHash) {
                 return { type: "RESOLVED", hash: oursHash };
@@ -1189,7 +1084,7 @@ class StorageService {
             };
         }
 
-        // ── Both sides modified ──
+        // Both modified.
         if (changeOurs === "MODIFIED" && changeTheirs === "MODIFIED") {
             if (oursHash === theirsHash) {
                 return { type: "RESOLVED", hash: oursHash };
@@ -1203,7 +1098,7 @@ class StorageService {
             };
         }
 
-        // ── One deleted, other modified ──
+        // One deleted, other modified.
         if (changeOurs === "DELETED" && changeTheirs === "MODIFIED") {
             return {
                 type: "CONFLICT",
@@ -1223,7 +1118,7 @@ class StorageService {
             };
         }
 
-        // Fallback — should be unreachable.
+        // Unreachable fallback.
         return { type: "RESOLVED", hash: baseHash };
     }
 

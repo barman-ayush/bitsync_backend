@@ -9,8 +9,6 @@ import { InviteByEmailResult, RepoInviteData } from "../types/notification.types
 import logger from "../services/logger.service";
 
 export class RepoController {
-    // inviteSummary - Shapes an invite batch result for API responses (counts
-    // for the buckets, raw emails for what the caller needs to act on).
     private static inviteSummary(result: InviteByEmailResult) {
         return {
             invited: result.created.length,
@@ -189,10 +187,6 @@ export class RepoController {
                 throw err;
             }
 
-            // Invitees go through the same repo_invite notification flow as the
-            // invite endpoint — they only become members once they accept. The
-            // repo is already committed, so an invite failure must not 500 the
-            // creation; it is reported as invites: null instead.
             let invites = null;
             if (users && users.length > 0) {
                 try {
@@ -228,9 +222,7 @@ export class RepoController {
             handleError("api/repo/create", err, next);
         }
     }
-    // showRepo - Page-mount response. Returns the full repo metadata resolved by
-    // resolveRepoBySlug, including the repo id and the caller's role. The FE holds
-    // the id and uses it for all subsequent tab/data calls (/:repoId/...).
+
     static async showRepo(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             const repo = req.repo;
