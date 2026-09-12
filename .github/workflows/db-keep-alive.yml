@@ -2,24 +2,86 @@ name: Database Keep-Alive
 
 on:
   schedule:
-    # Runs every hour at minute 0 (e.g. 00:00, 01:00, 02:00 UTC)
+    # Every hour
     - cron: '0 * * * *'
-  workflow_dispatch: # Enables manual execution from the GitHub Actions tab
+
+  # Allows manual execution from GitHub Actions
+  workflow_dispatch:
 
 jobs:
   ping-db:
-    name: Ping Aiven PostgreSQL Database
+    name: Keep Aiven PostgreSQL Alive
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      # --------------------------------------------------
+      # 1. Install Aiven CLI
+      # --------------------------------------------------
+      - name: Install Aiven CLI
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install aiven-client
 
-      - name: Setup Node.js Environment
+      # --------------------------------------------------
+      # 2. Authenticate with Aiven
+      # --------------------------------------------------
+      - name: Authenticate with Aiven
+        env:
+          AIVEN_TOKEN: ${{ secrets.AIVEN_TOKEN }}
+        run: |
+          avn user login --token "$AIVEN_TOKEN"
+
+      # --------------------------------------------------
+      # 3. Check PostgreSQL service state
+      # --------------------------------------------------
+      - name: Check Aiven PostgreSQL status
+        id: status
+        env:
+          AIVEN_PROJECT: ${{ secrets.AIVEN_PROJECT }}
+        run: |
+          STATE=$(avn service get pg-328a4daa \
+            --project "$AIVEN_PROJECT" \
+            --json | jq -r '.state')
+
+          echo "Current Aiven service state: $STATE"
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------
+      # 4. Power ON only if necessary
+      # --------------------------------------------------
+      - name: Power on PostgreSQL
+        if: steps.status.outputs.state != 'RUNNING'
+        env:
+          AIVEN_PROJECT: ${{ secrets.AIVEN_PROJECT }}
+        run: |
+          echo "PostgreSQL is not running."
+          echo "Powering on pg-328a4daa..."
+
+          avn service update pg-328a4daa \
+            --project "$AIVEN_PROJECT" \
+            --power-on
+
+      # --------------------------------------------------
+      # 5. Wait until Aiven reports RUNNING
+      # --------------------------------------------------
+      - name: Wait for PostgreSQL
+        if: steps.status.outputs.state != 'RUNNING'
+        env:
+          AIVEN_PROJECT: ${{ secrets.AIVEN_PROJECT }}
+        run: |
+          echo "Waiting for PostgreSQL to become RUNNING..."
+
+          avn service wait pg-328a4daa \
+            --project "$AIVEN_PROJECT"
+
+      # --------------------------------------------------
+      # 6. Ping PostgreSQL
+      # --------------------------------------------------
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
+          cache: npm
 
       - name: Install Dependencies
         run: npm ci
@@ -27,4 +89,5 @@ jobs:
       - name: Execute Database Ping
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npx ts-node scripts/ping-db.ts
+        run: |
+          npx ts-node scripts/ping-db.ts
